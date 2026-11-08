@@ -5,7 +5,7 @@
 
 | 项目 | 版本 | 发布日期 | 发布形态 | 状态 |
 | --- | --- | --- | --- | --- |
-| TTCoin_API | **1.0.0** | 2026-11-08 | 自建服务器部署（不上架任何商店） | 可发布；缓存命中率待线上按 §6.1 核对 |
+| TTCoin_API | **1.0.1** | 2026-11-08 | 自建服务器部署（不上架任何商店） | 可发布；缓存命中率待线上按 §6.1 核对 |
 
 **发布顺序**：`TTCoin_API` → `TTCoin_Widget` → `TTCoin_APP`。服务端先上线，否则表端一定 `No Net`（表端无法自证是网络问题还是服务端没起）。
 
@@ -15,7 +15,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | 1.0.0（首次作为独立项目发布，此前寄生在 `TTCoin_APP/api/`） |
+| 版本 | 1.0.1（1.0.0 起从 `TTCoin_APP/api/` 拆为独立项目；1.0.1 增加 `diag.php` 网页模式并修其配置加载） |
 | 运行环境 | PHP **7.4+**，扩展 `curl`、`json`；HTTPS 终结在 Web 服务器 |
 | 部署形态 | 单目录 PHP 脚本 + 文件缓存，无数据库、无框架、无 Composer |
 | 数据源 | `https://data-api.binance.vision/api/v3/ticker/24hr` |
@@ -33,8 +33,8 @@
 | `coin.php` | ✅ | 手表调用的主接口，三档响应 + 日志 |
 | `update_price.php` | ✅ | cron 预热：只写缓存，失败退出码 1 |
 | `lib.php` | ✅ | 抓取 / 格式化 / 缓存 / 日志 / 参数清洗（缺失则两个入口直接 fatal） |
-| `diag.php` | 建议 | 上游连通性诊断，**仅命令行可用**（网页访问 404）；报 `HTTP 0 timed out` 时先跑它 |
-| `.htaccess` | 建议 | Apache 兜底：拒绝 `coin_cache.json`、`coin.log`、`lib.php`、`diag.php` 直连 |
+| `diag.php` | 建议 | 上游连通性诊断；命令行始终可用，网页模式默认关闭（需 `TTCOIN_DIAG_TOKEN`）；报 `HTTP 0 timed out` 时先跑它 |
+| `.htaccess` | 建议 | Apache 兜底：拒绝 `coin_cache.json`、`coin.log`、`lib.php` 直连（`diag.php` 的访问控制由 PHP 里的密钥负责，网页模式需在 nginx/Apache 下都能用） |
 | `cache/.htaccess` | 建议 | 缓存目录兜底 |
 | `logs/.htaccess` | 建议 | 日志目录兜底 |
 | `config.php` | 可选 | 覆盖数据目录 / 时区 / Widget 精简开关；不存在走默认 |
@@ -227,3 +227,4 @@ tail -5 <数据目录>/logs/coin.log        # 第 5 列是否出现 hit / async
 | 日期 | 版本 | 内容 |
 | --- | --- | --- |
 | 2026-11-08 | 1.0.0 | 从 `TTCoin_APP/api/` 拆出为独立项目：三档响应（hit/async/fresh-stale-error）、`flock` 单飞后台刷新、`tmp+rename` 原子写缓存、`TTCOIN_DATA_DIR` 可配置、Widget 出口裁剪、日志时区与整行修复；上游改为多域名回退（`TTCOIN_API_FALLBACKS`）+ 记住成功域名 + 错误带 curl errno，新增 `diag.php` 与 `TTCOIN_PROXY` / `TTCOIN_RESOLVE` 两个逃生配置 |
+| 2026-11-08 | 1.0.1 | `diag.php` 新增带密钥的网页模式（`TTCOIN_DIAG_TOKEN`，不配仍返回 404，密钥短于 16 位视为未配置）；修复 `diag.php` 未加载 `config.php`、导致已配的 `TTCOIN_PROXY` / `TTCOIN_RESOLVE` / `TTCOIN_DATA_DIR` 在诊断里显示为默认值；`.htaccess` 不再拦 `diag.php`（访问控制交给 PHP，nginx 与 Apache 行为一致） |

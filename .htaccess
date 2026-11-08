@@ -1,14 +1,19 @@
 # 正常情况下缓存与请求日志都写在 ../cache、../logs，本文件只在
 # "父目录不可写"导致它们退回本目录时才起作用。同样是纵深防御。
+#
+# diag.php 不在这里拒绝：它的访问控制写在 PHP 里（config.php 的
+# TTCOIN_DIAG_TOKEN），不配密钥就是 404。这样做是因为本文件只对 Apache
+# 生效，而站点多半跑在 nginx 上——靠 .htaccess 挡不住，反而会把
+# "带密钥的网页诊断"一起挡死。
 
 <IfModule mod_authz_core.c>
-    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|diag\.php)$">
+    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php)$">
         Require all denied
     </FilesMatch>
 </IfModule>
 
 <IfModule !mod_authz_core.c>
-    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|diag\.php)$">
+    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php)$">
         Order allow,deny
         Deny from all
     </FilesMatch>

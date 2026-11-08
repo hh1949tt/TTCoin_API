@@ -1,14 +1,17 @@
 <?php
 /**
- * 上游连通性诊断。**只允许命令行运行**，网页访问一律 404。
+ * 上游连通性诊断。
  *
  * 用途：判断"连不上 Binance"到底卡在哪一层——DNS 污染、TCP 不通、
  * TLS 握手失败，还是上游返回了非 200。
  *
- * 用法（在 PHP 容器里）：
- *   docker exec -it <容器名> php /path/to/ttcoin/diag.php
- * 或者直接在站点目录下：
- *   php diag.php
+ * 两种用法：
+ *   1) 命令行（始终可用，推荐）
+ *        php diag.php
+ *        docker exec -it <容器名> php /path/to/ttcoin/diag.php
+ *   2) 浏览器（默认关闭；要开就在 config.php 里设 TTCOIN_DIAG_TOKEN）
+ *        https://<站点>/diag.php?k=<密钥>
+ *      没配密钥、没带 k、k 不对——一律 404，对外看不出这个文件存在。
  *
  * 输出内容：
  *   1. 环境：PHP 版本、curl 是否存在、代理/域名固定配置、数据目录、缓存新鲜度
@@ -16,22 +19,62 @@
  *   3. 结论提示
  */
 
-if (PHP_SAPI !== 'cli') {
-    http_response_code(404);
-    exit;
+// 先读 config.php：TTCOIN_DIAG_TOKEN / TTCOIN_PROXY / TTCOIN_RESOLVE / TTCOIN_DATA_DIR
+// 都写在里面，而 lib.php 只提供默认值，不会替你去读 config.php。
+// （以前漏了这一步，导致配了代理或钉了 IP，诊断输出里仍显示"空，直连"。）
+if (is_file(__DIR__ . '/config.php')) {
+    require __DIR__ . '/config.php';
+}
+
+$diagFromWeb = (PHP_SAPI !== 'cli');
+
+if ($diagFromWeb) {
+    $diagToken = defined('TTCOIN_DIAG_TOKEN') ? (string) TTCOIN_DIAG_TOKEN : '';
+    $diagGiven = (isset($_GET['k']) && is_string($_GET['k'])) ? $_GET['k'] : '';
+
+    // 密钥短于 16 字符当作没配；比较用 hash_equals（定长，不给时间侧信道）。
+    // 任何一项不满足都回 404 而不是 403：403 等于告诉对方"这文件有东西"。
+    if (strlen($diagToken) < 16 || $diagGiven === '' || !hash_equals($diagToken, $diagGiven)) {
+        http_response_code(404);
+        exit;
+    }
+
+    @error_log(sprintf(
+        '[ttcoin][diag] web mode, remote=%s',
+        isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '-'
+    ));
+
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('X-Robots-Tag: noindex, nofollow');
+
+    // 逐个域名探测，最坏几十秒：别让 max_execution_time 把输出截断。
+    @set_time_limit(120);
+    @ignore_user_abort(true);
 }
 
 require __DIR__ . '/lib.php';
+
+$diagStartedAt = microtime(true);
 
 function diag_line($label, $value)
 {
     printf("  %-22s %s\n", $label, $value);
 }
 
+if ($diagFromWeb) {
+    echo "TTCoin 上游诊断（网页模式）\n";
+    diag_line('访问时间', date('Y-m-d H:i:s'));
+    diag_line('来源 IP', isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '-');
+    diag_line('注意', '本次探测要占一个 PHP 进程几十秒，期间站点其它请求可能变慢');
+}
+
 echo "\n=== 1. 环境 ===\n";
 
 diag_line('PHP', PHP_VERSION . ' (' . PHP_SAPI . ')');
 diag_line('curl 扩展', function_exists('curl_init') ? '有' : '缺失（这就是原因）');
+diag_line('config.php', is_file(__DIR__ . '/config.php') ? '已加载' : '不存在（全部走默认值）');
+diag_line('运行方式', $diagFromWeb ? '浏览器（网页模式）' : '命令行');
 diag_line('TTCOIN_PROXY', (defined('TTCOIN_PROXY') && TTCOIN_PROXY !== '') ? TTCOIN_PROXY : '(空，直连)');
 diag_line('TTCOIN_RESOLVE', (defined('TTCOIN_RESOLVE') && TTCOIN_RESOLVE !== '') ? TTCOIN_RESOLVE : '(空)');
 diag_line('数据目录', ttcoin_data_dir());
@@ -126,3 +169,10 @@ echo "  DNS 有 IP 但 TCP 超时  -> 多半是 DNS 污染（解析到假 IP）�
 echo "  TCP 通但 TLS 未完成    -> 中间设备干扰 TLS，只能走代理\n";
 echo "  全部域名都超时         -> 出口被封，配 TTCOIN_PROXY 指向可用代理\n";
 echo "  某个域名 200           -> 那个域名可用，代码会自动优先用它（记在 cache/upstream.txt）\n\n";
+
+printf("探测结束，总耗时 %.2fs\n", microtime(true) - $diagStartedAt);
+
+if ($diagFromWeb) {
+    echo "\n看完了就把 config.php 里的 TTCOIN_DIAG_TOKEN 清空（或改掉），网页入口即自动关闭。\n";
+    echo "密钥会留在访问日志和浏览器历史里，别长期开着。\n";
+}

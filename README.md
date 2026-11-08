@@ -13,8 +13,8 @@
 | `coin.php` | 手表调用的主接口，带缓存与降级，按设备记请求日志 |
 | `update_price.php` | 可由 cron 预热的同一套逻辑（输出纯文本日志，失败退出码 1） |
 | `lib.php` | 抓取 / 校验 / 缓存 / 请求日志 / 参数清洗（两个入口共用） |
-| `diag.php` | 上游连通性诊断，**只能在命令行跑**（`php diag.php`），网页访问返回 404 |
-| `.htaccess` | 兜底：禁止直接访问缓存 / 日志 / `lib.php` / `diag.php` |
+| `diag.php` | 上游连通性诊断。命令行 `php diag.php` 始终可用；网页模式默认关闭，需在 `config.php` 设 `TTCOIN_DIAG_TOKEN` 后访问 `diag.php?k=<密钥>` |
+| `.htaccess` | 兜底：禁止直接访问缓存 / 日志 / `lib.php` |
 | `cache/.htaccess` | 仓库占位：缓存目录（服务器上运行时生成）禁止外部访问 |
 | `logs/.htaccess` | 同上，针对请求日志目录 |
 | `config.php` | 可选配置：指定数据目录（缓存 / 日志位置）、时区、Widget 精简开关。仓库自带一份、写的都是默认值，删掉也能跑（走 `lib.php` 里的常量） |
@@ -317,13 +317,23 @@ SHIB 这类币的原始价格是 `0.00001826`，按 4 位小数四舍五入会�
 2026-11-08 13:14:31 ERROR Binance HTTP 0 Connection timed out after 3000 milliseconds
 ```
 
-`HTTP 0` = 一个字节都没收到；`3000 milliseconds` 是连接超时（`update_price.php` 用 3 秒，`coin.php` 用 5 秒）。
+`HTTP 0` = 一个字节都没收到；`milliseconds` 是连接超时（`coin.php` 给 5 秒、后台刷新给 4 秒、`update_price.php` 给 3 秒，整体抓取预算分别是 10 / 15 / 8 秒）。
 
 先跑诊断，别靠猜：
 
 ```bash
 docker exec -it <php容器名> php /path/to/ttcoin/diag.php
 ```
+
+没有命令行、又不想 ssh 的话，可以开一个带密钥的网页入口：
+
+```php
+// config.php
+define('TTCOIN_DIAG_TOKEN', '你的一串随机字符（至少 16 位）');
+// 生成：openssl rand -hex 16
+```
+
+然后浏览器访问 `https://<站点>/diag.php?k=你的一串随机字符`。没配密钥、密钥不对、或没带 `k`，一律返回 404 —— 外人看不出这个文件存在。看完把这一行清空即可关闭。注意网页模式会占住一个 PHP 进程几十秒，期间站点其它请求会变慢；密钥也会出现在访问日志里。
 
 它会打印每个候选域名的 DNS 结果、TCP / TLS / 首字节各段耗时、curl errno，并给出结论。对照表：
 
