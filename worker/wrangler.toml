@@ -1,0 +1,20 @@
+# Cloudflare Worker 配置
+#
+# 部署：npx wrangler deploy
+# 本地：npx wrangler dev
+#
+# 先不配 routes，发到 workers.dev 上验证；确认没问题再取消注释，
+# 让 Worker 接管正式路径（手表地址一个字都不用改）。
+
+name = "ttcoin-api"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+# 正式接管：域名必须托管在同一个 Cloudflare 账号下
+# routes = [
+#   { pattern = "api.example.com/ttcoin/api/coin.php", zone_name = "example.com" }
+# ]
+
+# 可选：日志保留，排查 403 / 上游异常时有用（免费版也有 3 天）
+# [observability]
+# enabled = true
