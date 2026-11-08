@@ -9,12 +9,18 @@
  * 阻塞式抓取会占满 PHP-FPM 的 worker，手表 3 秒就超时了。Worker 跑在边缘，
  * 抓取和缓存都在离用户最近的地方完成，毫秒级返回。
  *
- * 数据源为什么不是币安：币安把 Cloudflare 的出口 IP 段（AS13335）整段挡了，
- * 从任何 colo 请求 api*.binance.com / data-api.binance.vision 都回
- * 403 + nginx 默认页（注意：不是 451 地域封锁，也不是 429 限流）。
- * 实测 HKG / HK 出口下，Bybit 与 Coinbase / Kraken 都是 200，所以主用 Bybit：
- * 它的现货符号与币安完全相同（BTCUSDT…），字段里同时有 lastPrice、
- * prevPrice24h、price24hPcnt，一次请求拿到价格和 24h 涨跌。
+ * 数据源为什么要多家自动切换：交易所对「数据中心 IP」的封锁按 IP 段做，而且
+ * 按地域不同。实测同一份代码，从香港节点打 Bybit 是 200/55ms，从洛杉矶节点
+ * 打 Bybit 却是 403 —— 这不是代码问题，是出口被拒。所以这里不押注单一家：
+ *
+ *   Coinbase（覆盖全部 11 个币，美/欧/亚都通，实测 7ms）
+ *     → Bybit（亚太通，符号与币安一致，做补充）
+ *
+ * 每家按「整家并行拉一次 + 谁缺就由下一家补」的方式合并，最终每个币只要有一家
+ * 给到价就算成功。全挂才退化到冷备，绝不给手表 503。
+ *
+ * 排查用：GET ?diag=1 会当场打印本次请求所在节点、出口国家、每家上游的真实
+ * 状态码与耗时。它不读缓存、不写缓存，是判断「这次是网络还是代码」的最快方式。
  *
  * 缓存策略（不用 KV，纯 Cache API）：
  *   - 新鲜副本 60 秒：过期前所有设备共享同一份，命中直接返回；
@@ -23,20 +29,8 @@
  *     拿它当键等于每台设备各存一份，等于没缓存。
  */
 
-// 上游符号 → 手表上显示的简称。顺序即响应顺序（与 PHP 版 ttcoin_symbols() 一致）。
-const SYMBOLS = [
-  ['BTCUSDT', 'BTC'],
-  ['ETHUSDT', 'ETH'],
-  ['DOGEUSDT', 'DOGE'],
-  ['SHIBUSDT', 'SHIB'],
-  ['SOLUSDT', 'SOL'],
-  ['BNBUSDT', 'BNB'],
-  ['XRPUSDT', 'XRP'],
-  ['ADAUSDT', 'ADA'],
-  ['LINKUSDT', 'LINK'],
-  ['LTCUSDT', 'LTC'],
-  ['AVAXUSDT', 'AVAX'],
-];
+// 币种基础符号。顺序即响应顺序（与 PHP 版 ttcoin_symbols() 一致）。
+const BASES = ['BTC', 'ETH', 'DOGE', 'SHIB', 'SOL', 'BNB', 'XRP', 'ADA', 'LINK', 'LTC', 'AVAX'];
 
 const MAX_DECIMALS = 4;          // 常规价格最多 4 位小数
 const MAX_DECIMALS_SCALED = 5;   // 小额币放大后放宽到 5 位
@@ -46,7 +40,64 @@ const WIDGET_TOP_N = 3;          // Widget 一屏 3 行
 const FRESH_TTL = 60;            // 秒
 const STALE_TTL = 7 * 86400;
 
+const UPSTREAM_TIMEOUT = 6000;   // 单家上游超时（毫秒）
+
 const CACHE_ORIGIN = 'https://ttcoin-cache.internal';
+
+/**
+ * 浏览器风格的请求头。交易所前置的 WAF 对「像脚本的 UA」比对人严得多，
+ * 默认的 Workers UA 在部分节点会直接吃 403。
+ */
+const BROWSER_HEADERS = {
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/131.0.0.0 Safari/537.36',
+};
+
+/**
+ * 上游定义。顺序即优先级，前一家已经给到的币不会被后一家覆盖。
+ *
+ * 每家只需实现两个方法：
+ *   url(base)                     → 上游请求地址
+ *   parse(json)                   → { lastPrice, prevPrice24h, price24hPcnt? }
+ */
+const PROVIDERS = [
+  {
+    name: 'coinbase',
+    url: (base) => 'https://api.exchange.coinbase.com/products/' + base + '-USD/stats',
+    parse: (json) => {
+      if (!json || typeof json.last !== 'string' || json.last === '') {
+        throw new Error('无 last 字段');
+      }
+
+      // stats 里的 open 是 24 小时前的开盘价，正好用来算涨跌幅
+      return { lastPrice: json.last, prevPrice24h: typeof json.open === 'string' ? json.open : null };
+    },
+  },
+  {
+    name: 'bybit',
+    url: (base) => 'https://api.bybit.com/v5/market/tickers?category=spot&symbol=' + base + 'USDT',
+    parse: (json) => {
+      if (!json || json.retCode !== 0) {
+        throw new Error('retCode ' + (json && json.retCode) + ' ' + ((json && json.retMsg) || ''));
+      }
+
+      const item = json.result && json.result.list && json.result.list[0];
+
+      if (!item || typeof item.lastPrice !== 'string') {
+        throw new Error('无 lastPrice 字段');
+      }
+
+      return {
+        lastPrice: item.lastPrice,
+        prevPrice24h: item.prevPrice24h,
+        price24hPcnt: item.price24hPcnt,
+      };
+    },
+  },
+];
 
 /**
  * 价格格式化：**全程字符串运算，不经过浮点**。
@@ -167,20 +218,20 @@ export function changeOf(item) {
   return null;
 }
 
-/** 把上游 item 集合拼成手表要的数组。任何一币失败就跳过它，不整体报错。 */
-export function buildPayload(bySymbol) {
+/** 把「每个币的行情」拼成手表要的数组，顺序固定为 BASES。 */
+export function buildPayload(quotes) {
   const result = [];
 
-  for (const [apiSymbol, label] of SYMBOLS) {
-    const item = bySymbol[apiSymbol];
+  for (const base of BASES) {
+    const item = quotes[base];
     if (!item) continue;
 
     const scaled = scalePrice(item.lastPrice);
     if (scaled.price === null) continue;
 
     result.push({
-      symbol: scaled.factor > 1 ? scaled.factor + '*' + label : label,
-      base: label,
+      symbol: scaled.factor > 1 ? scaled.factor + '*' + base : base,
+      base: base,
       price: scaled.price,
       change: changeOf(item),
     });
@@ -189,57 +240,72 @@ export function buildPayload(bySymbol) {
   return result;
 }
 
-/** 取单个币种。Bybit v5 现货 ticker，不传 symbol 会返回全量（太大），所以逐个取。 */
-async function fetchOne(apiSymbol) {
-  const url = 'https://api.bybit.com/v5/market/tickers?category=spot&symbol=' + apiSymbol;
+/** 取单个币，带超时。抛出的错误消息会被拼进最终结果，所以要说清是哪家挂的。 */
+async function fetchQuote(provider, base) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
 
-  const response = await fetch(url, {
-    headers: { 'Accept': 'application/json', 'User-Agent': 'TTCoin-Worker/1.0' },
-  });
+  try {
+    const response = await fetch(provider.url(base), {
+      headers: BROWSER_HEADERS,
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    throw new Error('bybit HTTP ' + response.status);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+
+    return provider.parse(await response.json());
+  } catch (err) {
+    if (err && err.name === 'AbortError') throw new Error('timeout ' + UPSTREAM_TIMEOUT + 'ms');
+    throw new Error((err && err.message) || String(err));
+  } finally {
+    clearTimeout(timer);
   }
-
-  const body = await response.json();
-
-  if (body.retCode !== 0) {
-    throw new Error('bybit retCode ' + body.retCode + ' ' + (body.retMsg || ''));
-  }
-
-  const item = body.result && body.result.list && body.result.list[0];
-
-  if (!item || typeof item.lastPrice !== 'string') {
-    throw new Error('bybit empty: ' + apiSymbol);
-  }
-
-  return item;
 }
 
+/**
+ * 按优先级逐家拉取：一家拉完还缺的币才交给下一家。
+ * 正常情况下只需 11 次子请求（Coinbase 一次拉全），远低于 Workers 的 50 次上限。
+ */
 async function fetchAll() {
-  // 并行取 11 个币种：串行的话边缘冷启动要 1 秒以上
-  const settled = await Promise.allSettled(SYMBOLS.map(([apiSymbol]) => fetchOne(apiSymbol)));
+  const quotes = {};
+  const lastError = {};
+  const sources = [];
+  let pending = BASES.slice();
 
-  const bySymbol = {};
-  const errors = [];
+  for (const provider of PROVIDERS) {
+    if (pending.length === 0) break;
 
-  settled.forEach((entry, index) => {
-    const apiSymbol = SYMBOLS[index][0];
+    const batch = pending;
+    const settled = await Promise.allSettled(batch.map((base) => fetchQuote(provider, base)));
 
-    if (entry.status === 'fulfilled') {
-      bySymbol[apiSymbol] = entry.value;
-    } else {
-      errors.push(apiSymbol + ': ' + entry.reason.message);
-    }
-  });
+    const nextPending = [];
+    let okCount = 0;
 
-  const data = buildPayload(bySymbol);
+    settled.forEach((entry, index) => {
+      const base = batch[index];
 
-  if (data.length === 0) {
-    return { ok: false, data: null, error: errors.join(' | ') || 'no valid price data' };
+      if (entry.status === 'fulfilled') {
+        quotes[base] = entry.value;
+        okCount++;
+      } else {
+        nextPending.push(base);
+        lastError[base] = provider.name + ' ' + entry.reason.message;
+      }
+    });
+
+    if (okCount > 0) sources.push(provider.name);
+
+    pending = nextPending;
   }
 
-  return { ok: true, data, error: errors.join(' | ') };
+  const data = buildPayload(quotes);
+  const errors = pending.map((base) => base + ': ' + (lastError[base] || 'no data'));
+
+  if (data.length === 0) {
+    return { ok: false, data: null, error: errors.join(' | ') || 'no valid price data', sources: '' };
+  }
+
+  return { ok: true, data, error: errors.join(' | '), sources: sources.join('+') };
 }
 
 function cacheKey(kind, type, stale) {
@@ -256,9 +322,56 @@ function respond(body, meta) {
       // 手表 60 秒自己请求一次，中间层再缓存只会让"退出再进"看到旧价
       'Cache-Control': 'no-store',
       'X-TTCoin-Cache': meta.cache,
-      'X-TTCoin-Source': 'bybit',
+      'X-TTCoin-Source': meta.sources || 'none',
       'X-TTCoin-Age': String(meta.age || 0),
       'X-TTCoin-Degraded': meta.degraded ? '1' : '0',
+    },
+  });
+}
+
+/**
+ * 现场体检：不读缓存、不写缓存，直接逐家打一次，把节点和真实状态码打出来。
+ * 判断「是出口被拒还是代码有 bug」用这个，比看日志快。
+ */
+async function runDiag(request) {
+  const cf = request.cf || {};
+  const lines = [];
+
+  lines.push('colo=' + (cf.colo || '?') + '  country=' + (cf.country || '?') + '  city=' + (cf.city || '?'));
+  lines.push('time=' + new Date().toISOString());
+  lines.push('');
+
+  for (const provider of PROVIDERS) {
+    const started = Date.now();
+
+    try {
+      const quote = await fetchQuote(provider, 'BTC');
+      lines.push(
+        '✅ ' + provider.name.padEnd(10) +
+        ' BTC last=' + quote.lastPrice +
+        ' prev=' + (quote.prevPrice24h || '-') +
+        '  ' + (Date.now() - started) + 'ms'
+      );
+    } catch (err) {
+      lines.push(
+        '❌ ' + provider.name.padEnd(10) + ' ' + err.message + '  ' + (Date.now() - started) + 'ms'
+      );
+    }
+  }
+
+  lines.push('');
+
+  const fetched = await fetchAll();
+
+  lines.push('聚合结果：' + (fetched.data ? fetched.data.length : 0) + '/' + BASES.length + ' 个币');
+  lines.push('实际来源：' + (fetched.sources || 'none'));
+  if (fetched.error) lines.push('失败明细：' + fetched.error);
+
+  return new Response(lines.join('\n') + '\n', {
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Robots-Tag': 'noindex',
     },
   });
 }
@@ -266,6 +379,9 @@ function respond(body, meta) {
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+
+    if (url.searchParams.get('diag') === '1') return runDiag(request);
+
     const type = url.searchParams.get('type') === 'widget' ? 'widget' : 'app';
     const cache = caches.default;
 
@@ -278,19 +394,25 @@ export default {
       const text = await hit.text();
       const age = Number(hit.headers.get('X-TTCoin-Stored') || 0);
       const seconds = age > 0 ? Math.max(0, Math.round(Date.now() / 1000 - age)) : 0;
-      return respond(trim(text, type), { cache: 'HIT', age: seconds });
+      return respond(trim(text, type), {
+        cache: 'HIT',
+        age: seconds,
+        sources: hit.headers.get('X-TTCoin-Source') || 'cache',
+      });
     }
 
     const fetched = await fetchAll();
 
     if (fetched.ok) {
       const full = JSON.stringify(fetched.data);
+      const stored = String(Math.round(Date.now() / 1000));
 
       const fresh = new Response(full, {
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
           'Cache-Control': 'public, max-age=' + FRESH_TTL,
-          'X-TTCoin-Stored': String(Math.round(Date.now() / 1000)),
+          'X-TTCoin-Stored': stored,
+          'X-TTCoin-Source': fetched.sources,
         },
       });
 
@@ -301,7 +423,8 @@ export default {
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
           'Cache-Control': 'public, max-age=' + STALE_TTL,
-          'X-TTCoin-Stored': String(Math.round(Date.now() / 1000)),
+          'X-TTCoin-Stored': stored,
+          'X-TTCoin-Source': fetched.sources,
         },
       });
 
@@ -309,6 +432,7 @@ export default {
 
       return respond(trim(full, type), {
         cache: 'MISS',
+        sources: fetched.sources,
         degraded: fetched.error !== '',
       });
     }
@@ -320,12 +444,21 @@ export default {
       const text = await staleHit.text();
       const stored = Number(staleHit.headers.get('X-TTCoin-Stored') || 0);
       const age = stored > 0 ? Math.round(Date.now() / 1000 - stored) : 0;
-      return respond(trim(text, type), { cache: 'STALE', age, degraded: true });
+      return respond(trim(text, type), {
+        cache: 'STALE',
+        age,
+        sources: staleHit.headers.get('X-TTCoin-Source') || 'cache',
+        degraded: true,
+      });
     }
 
     return new Response(JSON.stringify({ error: fetched.error }), {
       status: 503,
-      headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-TTCoin-Source': 'none',
+      },
     });
   },
 };

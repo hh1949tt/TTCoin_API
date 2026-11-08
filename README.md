@@ -18,7 +18,7 @@
 | `cache/.htaccess` | 仓库占位：缓存目录（服务器上运行时生成）禁止外部访问 |
 | `logs/.htaccess` | 同上，针对请求日志目录 |
 | `config.php` | 可选配置：指定数据目录（缓存 / 日志位置）、时区、Widget 精简开关。仓库自带一份、写的都是默认值，删掉也能跑（走 `lib.php` 里的常量） |
-| `worker/` | 可选：Cloudflare Workers 版实现（`worker.js` + `wrangler.toml`），输出契约与 `coin.php` 完全一致；托管出口到币安被 403 时用它替代 NAS，见 [worker/README.md](worker/README.md) |
+| `worker/` | 可选：Cloudflare Workers 版实现（`worker.js` + `wrangler.toml`），输出契约与 `coin.php` 完全一致；上游在 Coinbase / Bybit 之间自动切换，`?diag=1` 可现场体检，见 [worker/README.md](worker/README.md) |
 
 ## 环境要求
 

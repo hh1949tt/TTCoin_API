@@ -10,9 +10,15 @@ name = "ttcoin-api"
 main = "worker.js"
 compatibility_date = "2026-11-01"
 
-# 正式接管：域名必须托管在同一个 Cloudflare 账号下
+# 正式接管：域名必须托管在同一个 Cloudflare 账号下。
+#
+# 末尾那个 `*` 不能省：CF 的路由匹配把查询串算进整条 URL，而模式里又不许写
+# `?foo=*`。所以 `.../coin.php` 只能匹配「不带参数」的请求，手表每次带的
+# `?type=app` 会漏回源站（实测就是 521）。官方文档原文：
+#   "the only way to have a route pattern match URLs with query parameters
+#    is to terminate it with a wildcard, *"
 # routes = [
-#   { pattern = "api.example.com/ttcoin/api/coin.php", zone_name = "example.com" }
+#   { pattern = "api.example.com/ttcoin/api/coin.php*", zone_name = "example.com" }
 # ]
 
 # 可选：日志保留，排查 403 / 上游异常时有用（免费版也有 3 天）

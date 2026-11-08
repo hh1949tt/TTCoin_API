@@ -5,7 +5,7 @@
 
 | 项目 | 版本 | 发布日期 | 发布形态 | 状态 |
 | --- | --- | --- | --- | --- |
-| TTCoin_API | **1.0.1** | 2026-11-08 | 自建服务器部署（不上架任何商店） | 可发布；缓存命中率待线上按 §6.1 核对 |
+| TTCoin_API | **1.0.2** | 2026-11-08 | 自建服务器部署（不上架任何商店） | 可发布；缓存命中率待线上按 §6.1 核对 |
 
 **发布顺序**：`TTCoin_API` → `TTCoin_Widget` → `TTCoin_APP`。服务端先上线，否则表端一定 `No Net`（表端无法自证是网络问题还是服务端没起）。
 
@@ -15,7 +15,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | 1.0.1（1.0.0 起从 `TTCoin_APP/api/` 拆为独立项目；1.0.1 增加 `diag.php` 网页模式并修其配置加载） |
+| 版本 | 1.0.2（1.0.0 从 `TTCoin_APP/api/` 拆为独立项目；1.0.1 增加 `diag.php` 网页模式；1.0.2 为 `worker/` 增加多上游自动切换与 `?diag=1`） |
 | 运行环境 | PHP **7.4+**，扩展 `curl`、`json`；HTTPS 终结在 Web 服务器 |
 | 部署形态 | 单目录 PHP 脚本 + 文件缓存，无数据库、无框架、无 Composer |
 | 数据源 | `https://data-api.binance.vision/api/v3/ticker/24hr` |
@@ -228,3 +228,4 @@ tail -5 <数据目录>/logs/coin.log        # 第 5 列是否出现 hit / async
 | --- | --- | --- |
 | 2026-11-08 | 1.0.0 | 从 `TTCoin_APP/api/` 拆出为独立项目：三档响应（hit/async/fresh-stale-error）、`flock` 单飞后台刷新、`tmp+rename` 原子写缓存、`TTCOIN_DATA_DIR` 可配置、Widget 出口裁剪、日志时区与整行修复；上游改为多域名回退（`TTCOIN_API_FALLBACKS`）+ 记住成功域名 + 错误带 curl errno，新增 `diag.php` 与 `TTCOIN_PROXY` / `TTCOIN_RESOLVE` 两个逃生配置 |
 | 2026-11-08 | 1.0.1 | `diag.php` 新增带密钥的网页模式（`TTCOIN_DIAG_TOKEN`，不配仍返回 404，密钥短于 16 位视为未配置）；修复 `diag.php` 未加载 `config.php`、导致已配的 `TTCOIN_PROXY` / `TTCOIN_RESOLVE` / `TTCOIN_DATA_DIR` 在诊断里显示为默认值；`.htaccess` 不再拦 `diag.php`（访问控制交给 PHP，nginx 与 Apache 行为一致） |
+| 2026-11-08 | 1.0.2 | `worker/` 上游改为 Coinbase → Bybit 自动切换（实测同一份代码在 HKG 打 Bybit 200、在 LAX 打 Bybit 11 币全 403，属地域/出口封锁，不能押注单一家）；新增 `?diag=1` 现场体检（打印 colo、出口国家、每家上游状态与耗时，不读不写缓存）；响应头补 `X-TTCoin-Source`；`wrangler.toml` 路由模式补末尾 `*`——CF 路由匹配含查询串，`.../coin.php` 会让带 `?type=` 的请求漏回源站 |
