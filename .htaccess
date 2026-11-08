@@ -1,0 +1,15 @@
+# 正常情况下缓存与请求日志都写在 ../cache、../logs，本文件只在
+# "父目录不可写"导致它们退回本目录时才起作用。同样是纵深防御。
+
+<IfModule mod_authz_core.c>
+    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|diag\.php)$">
+        Require all denied
+    </FilesMatch>
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|diag\.php)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+</IfModule>

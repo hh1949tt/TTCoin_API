@@ -1,0 +1,19 @@
+# ---- 运行时数据（缓存与日志绝不入库）----
+cache/*
+!cache/.htaccess
+logs/*
+!logs/.htaccess
+*.log
+
+# ---- 本地个性化配置 ----
+# config.php 只有开关与目录、没有密钥，仓库里给的是默认值；
+# 如果你本地把数据目录挪到了 docroot 之外，注意别把私有路径推上来。
+# 想彻底避免冲突，可改为忽略它并使用 config.example.php
+# config.php
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp

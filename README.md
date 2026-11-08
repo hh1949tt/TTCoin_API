@@ -1,0 +1,348 @@
+# TTCoin API
+
+> TTCoin 的服务端中转：把 Binance 的 24h ticker 裁剪成手表能直接显示的 JSON，带文件缓存、降级与按设备请求日志。
+
+> **项目关系**：本目录原先是 `TTCoin_APP/api/`（三个形态共用同一套服务端代码）。
+> 现在独立成 `TTCoin_API`，与 `TTCoin_APP`（Watch App 版）、`TTCoin_Widget`（Widget 版）平级——
+> 手表端的接口约定、部署方式见本 README；表端编译与屏幕适配见各自项目的 README。
+
+## 文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `coin.php` | 手表调用的主接口，带缓存与降级，按设备记请求日志 |
+| `update_price.php` | 可由 cron 预热的同一套逻辑（输出纯文本日志，失败退出码 1） |
+| `lib.php` | 抓取 / 校验 / 缓存 / 请求日志 / 参数清洗（两个入口共用） |
+| `diag.php` | 上游连通性诊断，**只能在命令行跑**（`php diag.php`），网页访问返回 404 |
+| `.htaccess` | 兜底：禁止直接访问缓存 / 日志 / `lib.php` / `diag.php` |
+| `cache/.htaccess` | 仓库占位：缓存目录（服务器上运行时生成）禁止外部访问 |
+| `logs/.htaccess` | 同上，针对请求日志目录 |
+| `config.php` | 可选配置：指定数据目录（缓存 / 日志位置）、时区、Widget 精简开关。仓库自带一份、写的都是默认值，删掉也能跑（走 `lib.php` 里的常量） |
+
+## 环境要求
+
+- PHP 7.4+，启用 `curl` 与 `json` 扩展
+- 任意支持 HTTPS 的 Web 服务器（Nginx / Apache / 宝塔 / 虚拟主机均可）
+- **必须是 HTTPS**，Connect IQ 默认拒绝明文 HTTP 请求
+
+## 后端部署
+
+### 1. 上传文件
+
+把本目录下的**四个文件**（`coin.php`、`update_price.php`、`lib.php`、`.htaccess`）上传到站点目录。`lib.php` 是前两个共用的依赖，缺了会直接报 `require` 失败。`config.php` 是可选配置（仓库自带、内容等于默认值），不需要就删掉，需要时再改（见下一节）。
+
+### 2. 数据目录：缓存与日志放哪
+
+默认写在**站点目录的上一级**：`../cache/coin.json`、`../logs/coin.log`。这个默认值是为"站点目录 = docroot"设计的——上一级天然在 docroot 之外，外网拿不到。
+
+想放别处就设 `TTCOIN_DATA_DIR`，两种写法任选：
+
+```php
+// 站点目录下建 config.php（推荐，不必改 coin.php / update_price.php）
+<?php
+define('TTCOIN_DATA_DIR', __DIR__);          // 数据落在站点目录内的 cache/ 与 logs/
+// define('TTCOIN_DATA_DIR', '/var/www/data');  // 或任意绝对路径
+```
+
+```yaml
+# 或走环境变量（docker-compose / php-fpm env / nginx fastcgi_param 都认）
+environment:
+  TTCOIN_DATA_DIR: /var/www/data
+```
+
+脚本在数据目录下再建 `cache/` 与 `logs/`，权限 0755、递归创建。三种结果：
+
+| 情况 | 实际路径 |
+| --- | --- |
+| 未配置 `TTCOIN_DATA_DIR` | `<站点目录>/../cache`、`<站点目录>/../logs` |
+| 配置为 `__DIR__`（站点目录） | `<站点目录>/cache`、`<站点目录>/logs` |
+| 数据目录不可写、子目录也建不出来 | 退回 `coin_cache.json`、`coin.log`（与 `coin.php` 同级，最后的兜底） |
+
+以站点目录 `/var/www/www/ttcoin` 为例：
+
+| 配置 | 缓存 | 日志 |
+| --- | --- | --- |
+| 默认 | `<数据目录>/cache/coin.json` | `<数据目录>/logs/coin.log` |
+| `define('TTCOIN_DATA_DIR', __DIR__)` | `<站点目录>/cache/coin.json` | `<站点目录>/logs/coin.log` |
+
+权限：目录属主要能写。容器里通常是 `www-data`（Alpine 镜像多为 `nginx` / `82`），必要时 `chown -R www-data:www-data <数据目录>`。
+
+#### 数据会不会被公网访问？
+
+只看一件事：**数据目录在不在 docroot 之内**。
+
+| 数据目录位置 | 结论 |
+| --- | --- |
+| docroot 之外 | 安全，无需额外配置（默认配置通常就是这种） |
+| docroot 之内（例如 docroot 就是 `www`，而数据在 `www/cache`、`www/ttcoin/cache`） | **可直接 GET**，必须挡 |
+
+实测最准：
+
+```bash
+curl -sI https://your-domain.com/cache/coin.json | head -1   # 200 = 暴露了
+curl -sI https://your-domain.com/ttcoin/logs/coin.log | head -1
+```
+
+**Nginx 不读 `.htaccess`**（Docker 部署基本都是 Nginx + php-fpm），此时 `cache/.htaccess`、`logs/.htaccess` 都不起作用，必须在站点配置里挡。路径按数据的 URL 前缀写：
+
+```nginx
+# docroot = www，数据在 www/ttcoin/cache、www/ttcoin/logs
+location ^~ /ttcoin/cache/ { deny all; }
+location ^~ /ttcoin/logs/  { deny all; }
+```
+
+要放在 `location ~ \.php$` **之前**，否则请求会先交给 PHP。最省事的组合仍是让数据落在 docroot 之外，`.htaccess` 与 deny 规则都不用管。
+
+### 3. 验证
+
+```bash
+curl -s https://your-domain.com/coin.php
+# 期望输出：
+# [{"symbol":"BTC","base":"BTC","price":"75701.02","change":"2.3"},{"symbol":"1000*SHIB","base":"SHIB","price":"0.01826","change":"-1.32"},…]
+```
+
+### 4. （可选）用 cron 预热缓存
+
+`update_price.php` 与 `coin.php` 共用 `lib.php` 里的抓取逻辑，区别只是**不读缓存、只写缓存**，且失败时退出码为 `1`（便于 cron 邮件或监控发现）。适合放到定时任务里，让手表请求永远命中缓存：
+
+```cron
+# 每 10 秒刷新一次（部分主机不允许 <1min 的间隔，按需调整）
+* * * * * for i in 0 10 20 30 40 50; do sleep $i; php /var/www/html/update_price.php >> /var/log/ttcoin.log 2>&1; done
+```
+
+### 5. 安全建议（公开部署必看）
+
+- 缓存与请求日志默认在站点目录的上一级（`../cache/coin.json`、`../logs/coin.log`）。若 docroot 恰好是那一级（如 `www` 为根、接口在 `www/ttcoin/`），它们仍在可访问范围内：Apache 下靠两个 `.htaccess` 兜底，**Nginx 下必须自己加** `location ^~ /ttcoin/cache/ { deny all; }` 之类（放在 PHP location 之前）；更彻底的办法是用 `TTCOIN_DATA_DIR` 把数据指到 docroot 之外，见上文「数据目录：缓存与日志放哪」；
+- 增加简单的来源/频率限制，防止接口被刷；
+- 若要对外开放给他人使用，请在 README 中明确写出你的服务可用性无承诺。
+
+## 接口约定
+
+### 请求
+
+```
+GET /coin.php
+GET /coin.php?uid=ac915d426451c88e8ea691fa412f9af9c21b4d12
+GET /coin.php?uid=ac915d...&type=app
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `uid`（可选） | 设备唯一标识，取自 `System.getDeviceSettings().uniqueIdentifier`（API 2.4.1+）：同一设备 + 本应用取值恒定、卸载重装不变、**不同应用之间取值不同**。手表端取不到时就不带这个参数 |
+| `type`（可选） | 客户端形态标记：Watch App 版固定发 `app`，Widget 版固定发 `widget`，服务端日志里区分同一块表上的两种安装形态 |
+
+服务端处理方式（`lib.php` `ttcoin_client_uid()`）：
+
+- 只留字母数字、最长 64，白名单清洗，防注入；
+- 用于**响应头回显** `X-TTCoin-Uid: <uid>`，方便端到端验证链路；
+- 用于**按设备记请求日志**：`coin.php` 每次请求都往 `../logs/coin.log` 追加一行（时间、形态、uid、来源 IP、事件、备注），见下文[请求日志](#请求日志)；
+- **不参与缓存键**——缓存是全体设备共享的（这正是中转层省流量的意义），uid 将来可用于按设备统计 / 限流，取 `ttcoin_client_uid()` 的返回值即可。
+
+`type` 的服务端处理（`lib.php` `ttcoin_client_type()`）：白名单只认 `app` / `widget` 两个值，其他一律按未提供处理。除进日志外，`widget` 还会触发[精简输出](#widget-只回前-3-项开关)。
+
+无鉴权。响应头 `Content-Type: application/json; charset=utf-8`。
+
+### Widget 只回前 3 项（开关）
+
+Widget 版一屏只有 3 行，多给的条目它也翻不到（Widget 显示几秒就被系统回收，8 秒/页的轮播基本转不起来）。所以默认**只给 Widget 回前 3 项**：
+
+| 请求 | 返回 |
+| --- | --- |
+| `?type=widget` | 候选池顺序的前 3 项 |
+| `?type=app` | 全部候选币种 |
+| 不带 `type` | 全部（无法判断形态，按最保守处理） |
+
+```bash
+curl -s 'https://your-domain.com/coin.php?type=widget' | grep -o '"base":"[^"]*"'
+# "base":"BTC"  "base":"ETH"  "base":"DOGE"
+```
+
+关闭开关（回到"Widget 也拿全部"）：
+
+```php
+// 站点目录的 config.php
+define('TTCOIN_WIDGET_LIMIT', false);
+```
+
+或者容器里加环境变量 `TTCOIN_WIDGET_LIMIT=0`（认 `0` / `false` / `off` / `no`，其余都当开启）。
+
+几个关键点：
+
+- **缓存里永远是完整列表**，裁剪只发生在出口。所以开关随时切换、App 与 Widget 交替请求都不会触发重新抓上游，也不存在"Widget 先把缓存写窄、App 就少了几项"的问题；
+- 条数由 `TTCOIN_WIDGET_TOP_N` 决定（默认 3，与 `TTCoin_Widget` 的 `PAGE_ROWS` 对齐）；改成 4 也不会让 Widget 多显示一行，只会多传一项；
+- **想挑哪 3 个给 Widget，就调 `ttcoin_symbols()` 的顺序**——裁剪取的是候选池的**前 N 项**，不是"涨得最多的 3 个"；
+- 命中精简模式时，请求日志第 6 列会写上 `top3`，便于确认开关是否生效。
+
+
+### 请求日志
+
+`coin.php` 每次请求（含命中缓存的）都会落一行日志，制表符分隔 6 列，方便 `grep` / `awk` / 导表格：
+
+```text
+2026-11-08 07:05:49	app	ac915d426451...	203.0.113.7	hit
+2026-11-08 07:06:49	widget	ac915d426451...	203.0.113.7	fresh
+2026-11-08 07:07:49	-	-	198.51.100.2	error	Binance HTTP 503 Connection timed out
+```
+
+| 列 | 内容 |
+| --- | --- |
+| 1 | 请求时间（见下方时区说明，默认北京时间） |
+| 2 | 客户端形态：`app` / `widget`，未携带或非法时为 `-` |
+| 3 | uid，未提供时为 `-` |
+| 4 | 客户端 IP（`REMOTE_ADDR`），排障用 |
+| 5 | 事件：`hit`（命中新鲜缓存）/ `async`（返回旧缓存，响应结束后后台刷新）/ `fresh`（阻塞重拉上游成功）/ `stale`（上游失败、返回旧缓存）/ `error`（502 或 500） |
+| 6 | 备注（失败原因、`age=秒` 等，可为空；Widget 精简模式生效时写 `top3`） |
+
+- 文件位置由数据目录决定（见「数据目录：缓存与日志放哪」）：默认 `<站点目录>/../logs/coin.log`，可用 `TTCOIN_DATA_DIR` 改成 `<数据目录>/logs/coin.log`；只有连子目录都建不出来时才退回与 `coin.php` 同级的 `coin.log`；
+- 单文件超过 2MB 自动滚动为 `coin.log.old`（覆盖上一代），不会无限增长；
+- 每条严格占一行（行尾 `\n`）；`detail` 里的换行 / 制表符会先压成空格，避免一条被拆成多行或多出列；
+- 若日志文件末尾缺少换行（旧版本写入的文件会把整个日志粘成一行），追加时会先补一个换行，不必手工清理；
+- 日志时间默认用**北京时间**（`Asia/Shanghai`）。Docker 容器里 PHP 默认是 UTC，不设置就会慢 8 小时——`lib.php` 已统一处理；想改用其他时区（如 `UTC`），在 `config.php` 里 `define('TTCOIN_TIMEZONE', 'UTC');`；
+- 日志写入失败是静默的，不影响接口正常响应；
+- 隐私提示：uid 只是应用级匿名设备标识（关联不到 Garmin 账号），IP 建议仅用于排障、按需定期清理。
+
+同一块表装两种形态时 **uid 相同、type 不同**：想看某块表的轨迹用 uid 过滤，想对比 APP 版 / Widget 版活跃度用 type 过滤。
+
+### 响应行为：新鲜 / 异步 / 阻塞
+
+上游（Binance）从服务器出发有时要 5~30 秒，手表的请求等不了那么久，会直接超时（表现为 `- Offline -`）。所以接口按缓存年龄分三档：
+
+| 缓存年龄 | 行为 | 手表感受 |
+| --- | --- | --- |
+| < `TTCOIN_CACHE_TTL`（默认 10s） | 直接返回缓存 | 秒回，日志 `hit` |
+| 10s ~ `TTCOIN_STALE_SERVE`（默认 600s） | **先返回旧缓存**，`fastcgi_finish_request()` 交出响应后再在后台抓一次并写缓存 | 秒回，日志 `async`、备注 `age=N` |
+| 无缓存 / 超过 600s / 非 PHP-FPM | 阻塞式抓取（最多 10s 超时），失败退回旧缓存 | 慢，最差 `stale` 或 `502` |
+
+后台刷新用 `flock` 做单飞：并发 10 个请求也只有一个真的去拉上游，其余加锁失败直接放弃（它们的响应早已发出）。
+
+> 只有 PHP-FPM 才有 `fastcgi_finish_request()`。Apache `mod_php` 下自动退回阻塞式流程，功能不变、只是慢一些——这种环境建议配 cron 预热。
+
+### 成功响应 `200`
+
+```json
+[
+  { "symbol": "BTC",       "base": "BTC",  "price": "75701.02", "change": "2.3" },
+  { "symbol": "ETH",       "base": "ETH",  "price": "2235.51" },
+  { "symbol": "1000*SHIB", "base": "SHIB", "price": "0.01826",  "change": "-1.32" }
+]
+```
+
+- 返回**全部候选币种**（当前 11 个：BTC ETH DOGE SHIB SOL BNB XRP ADA LINK LTC AVAX），显示哪些由客户端配置决定；个别候选失败会被跳过，只要还有一个有效条目就算成功；
+- `symbol` 是**表端直接显示的文本**。小额币种会带放大倍数前缀（见下文[小额价格放大](#小额价格放大)），例如 `1000*SHIB`；
+- `base` 是**原始简称**，永远是 `ttcoin_symbols()` 里的值。表端的菜单勾选、本地缓存匹配都用它——不要拿 `symbol` 去比，否则 `1000*SHIB` 会匹配不上 `SHIB`；
+- `price` 为 **字符串**（不是数字），已按"上游几位就几位、超过 4 位才四舍五入"规整好，客户端**原样显示**；
+- `change` 为 24 小时涨跌幅**字符串**（如 `"2.3"` / `"-1.23"` / `"0"`），来自 Binance `ticker/24hr` 的 `priceChangePercent`，**不受放大影响**（百分比与倍数无关）；
+- 客户端已做防御：**少返回、乱返回都不会崩**，无法识别的条目会被跳过（最多画 3 行），但顺序仍建议保持不变。
+
+> 为什么用字符串：价格一旦经过 `float`，小数位就回不来了。服务端用字符串运算保留上游原始位数，手表端直接拼字符串，两头都不碰浮点。
+
+### 失败响应 `502`
+
+```json
+{ "error": "Binance HTTP 502 Connection timed out" }
+```
+
+服务端会在上游失败时优先返回**上一次成功缓存**（不看 TTL），只有缓存也不存在时才返回 502。客户端只依赖状态码和"响应体是不是数组"，因此 `error` 字段的文案可以随意调整。
+
+极端情况下（写入的值无法编码成 JSON）返回 `500 { "error": "json_encode failed" }`，且不会污染缓存。
+
+### 小数位怎么定
+
+**跟着上游 API 的实际位数走**，只有超过 4 位才四舍五入（`TTCOIN_MAX_DECIMALS`）。Binance 固定下发 8 位小数（涨跌幅同理），所以第一步先去掉尾部多余的 0：
+
+| 上游原始值 | 输出 | 说明 |
+| --- | --- | --- |
+| `75701.02000000` | `75701.02` | 去尾零，2 位 |
+| `2235.51000000` | `2235.51` | 去尾零，2 位 |
+| `0.07161000` | `0.0716` | 5 位 → 四舍五入到 4 位 |
+| `1234.56789` | `1234.5679` | 5 位 → 进位 |
+| `0.12300000` | `0.123` | 3 位 |
+| `67000.00000000` | `67000` | 整数不留小数点 |
+| `9.99999000` | `10` | 进位后不留小数点 |
+
+实现在 `lib.php` 的 `ttcoin_format_price()`，**全程字符串 / 整数运算，不经过 `float`**。客户端只负责拼接，不再做任何格式化。
+
+早期版本是在手表端 `format("%0.4f")`，结果是 BTC 显示成 `75678.7812` —— Monkey C 的 `Float` 是 32 位，`75678.78` 存进去实际是 `75678.78125`，后两位纯属精度噪声。这个坑也写在 [`TTCoin_APP/docs/CODE_REVIEW.md`](https://github.com/__GH_OWNER__/TTCoin_APP/blob/main/docs/CODE_REVIEW.md) 的"踩坑记录"里。
+
+⚠️ 例外：价格小于 `0.0001` 时 4 位会显示成 `0`——这类币由下一节的小额放大处理，不需要调大 `TTCOIN_MAX_DECIMALS`。
+
+### 小额价格放大
+
+SHIB 这类币的原始价格是 `0.00001826`，按 4 位小数四舍五入会变成 `"0"`，屏幕上什么都没了。所以价格小于 `0.0001` 时，服务端按**小数部分前导 0 的个数 n** 放大，并把倍数写进币种名：
+
+| 前导 0 个数 n | 原始值 | 倍数 | 输出价格 | 显示名 |
+| --- | --- | --- | --- | --- |
+| 3 | `0.000123` | ×100 | `0.0123` | `100*XXX` |
+| 4 | `0.00001826` | ×1000 | `0.01826` | `1000*XXX` |
+| 5 | `0.00000715` | ×10000 | `0.0715` | `10000*XXX` |
+| 6 | `0.00000012` | ×100000 | `0.012` | `100000*XXX` |
+
+规律：**乘到第一个有效数字落在小数点后第 2 位**（`0.0xxx`），放大后的量级和 `0.07` / `0.18` 这些常规币种一致，一眼能读出"万分之一"还是"十万分之一"。倍数 = `10^(n-1)`，与表里 `100 / 1000 / 10000` 的关系一致，再往小以此类推。
+
+不触发放大的情况：
+
+- 整数部分非 0（正常价格）；
+- 前导 0 少于 3 个（`0.07`、`0.001` 本来就看得清）；
+- 去掉尾部 0 后本来就在 4 位小数以内（如 `0.0001`，原样显示就可以）；
+- 负数 / 科学计数法 / 脏数据（走常规格式化，`ttcoin_format_price()` 会挡掉非法值）。
+
+放大后价格最多显示 5 位小数（`TTCOIN_MAX_DECIMALS_SCALED`），比常规多一位——否则 `0.01826` 会被重新压回 4 位，等于白放大。
+
+实现在 `lib.php` 的 `ttcoin_scale_price()`：**直接移位小数串**（`0.00001826` → `"0.0" + "1826"`），不经过 `float`，所以不会出现 `0.018260000000000002` 这种尾巴。
+
+表端注意：带前缀的显示名更长（`1000*SHIB: 0.01826`），APP 版会自动降一档字体，Widget 版同样会整页降档；这是因为两边本来就有"最宽一行放不下就降字号"的逻辑，不需要额外处理。
+
+## 自定义配置（服务端）
+
+| 想改什么 | 改哪里 | 说明 |
+| --- | --- | --- |
+| 币种列表 | `lib.php` 的 `ttcoin_symbols()` | **只改这一处**，输出顺序 = 数组顺序；`TTCoin_APP` 的 `source/TTCoinView.mc` `COINS` 要同步（菜单展示用） |
+| 小数位上限 | `lib.php` 的 `TTCOIN_MAX_DECIMALS` | 默认 4；上游位数超过它才四舍五入 |
+| 放大阈值 | `lib.php` 的 `TTCOIN_SCALE_MIN_ZEROS` | 默认 3：小数部分前导 0 达到 3 个才放大（×100 起） |
+| 放大后位数 | `lib.php` 的 `TTCOIN_MAX_DECIMALS_SCALED` | 默认 5；放大后的价格允许比常规多显示一位 |
+| 缓存时长 | `lib.php` 的 `TTCOIN_CACHE_TTL` | 单位秒，默认 10；建议 <= cron 间隔 |
+| 旧值可用窗口 | `lib.php` 的 `TTCOIN_STALE_SERVE` | 单位秒，默认 600；过期后仍可先返回旧值并后台刷新，超时才阻塞 |
+| 时区 | `config.php` 的 `TTCOIN_TIMEZONE` | 默认 `Asia/Shanghai`，影响日志时间戳 |
+| Widget 精简开关 | `lib.php` 的 `TTCOIN_WIDGET_LIMIT`（或 `config.php` / 环境变量同名覆盖） | 默认 `true`：`?type=widget` 只回前 N 项；`false` 回全部 |
+| 精简条数 | `lib.php` 的 `TTCOIN_WIDGET_TOP_N` | 默认 3，与 Widget 一屏行数一致 |
+| 数据源 | `lib.php` 的 `TTCOIN_API_URL` + `TTCOIN_API_FALLBACKS` | 主域名失败会按顺序换备用域名（同一套 API）；换交易所需同步改 `ttcoin_fetch()` 的解析字段 |
+| 上游代理 | `config.php` 的 `TTCOIN_PROXY` | 空 = 直连；服务器到 Binance 全域名都不通时配它（如 `http://192.168.1.10:7890`） |
+| 域名固定 IP | `config.php` 的 `TTCOIN_RESOLVE` | 绕开 DNS 污染，格式 `域名:443:IP`，多个用分号隔开 |
+
+## 排查：连不上上游（`HTTP 0 … timed out`）
+
+日志里出现这类记录，说明**服务器到 Binance 的 TCP 连接没建立起来**，跟手表、跟代码无关：
+
+```
+2026-11-08 13:14:31 ERROR Binance HTTP 0 Connection timed out after 3000 milliseconds
+```
+
+`HTTP 0` = 一个字节都没收到；`3000 milliseconds` 是连接超时（`update_price.php` 用 3 秒，`coin.php` 用 5 秒）。
+
+先跑诊断，别靠猜：
+
+```bash
+docker exec -it <php容器名> php /path/to/ttcoin/diag.php
+```
+
+它会打印每个候选域名的 DNS 结果、TCP / TLS / 首字节各段耗时、curl errno，并给出结论。对照表：
+
+| 诊断结果 | 含义 | 处理 |
+| --- | --- | --- |
+| DNS 解析失败 | 容器 DNS 不通 | 改容器 `/etc/resolv.conf` 或换 DNS |
+| 有 IP 但 TCP 超时 | 多半解析到了假 IP（DNS 污染） | 用 `TTCOIN_RESOLVE` 把域名钉到真 IP |
+| TCP 通但 TLS 未完成 | 中间设备干扰 TLS | 只能走 `TTCOIN_PROXY` |
+| 全部域名超时 | 出口被封 | 配 `TTCOIN_PROXY` |
+| 某个域名返回 200 | 那个可用 | 不用管，代码会自动优先用它 |
+
+代码默认会依次尝试 `data-api.binance.vision`、`api.binance.com`、`api1~4.binance.com`，任一通了就记到 `<数据目录>/cache/upstream.txt`，之后优先使用。这段逻辑只影响"取数据"，不影响表端：取不到时仍按旧值窗口返回缓存（见「响应行为」）。
+
+## 免责声明
+
+- 本项目仅用于个人学习与自用，行情数据来自第三方公开接口，**不保证准确性、实时性与可用性**；
+- 所有价格仅供参考，**不构成任何投资建议**；
+- 请遵守 Binance 及各数据提供方的服务条款，不要高频抓取。
+
+## License
+
+见仓库根目录的 `LICENSE`。

@@ -1,0 +1,18 @@
+# 请求日志目录：禁止外部访问。
+#
+# 本目录在站点目录的上一级（../logs）。若 Web 根恰好在上一级
+# （例如 ::/www 为根、接口在 /www/app/coin.php），coin.log 就会
+# 落在可直接 GET 的位置，这里做一层兜底。
+#
+# 注意：Nginx 不读 .htaccess。Docker / Nginx 部署请在站点配置里加：
+#   location ^~ /logs/ { deny all; }
+# 且必须放在 location ~ \.php$ 之前。
+
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>
