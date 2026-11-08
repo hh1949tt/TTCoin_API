@@ -263,7 +263,7 @@ define('TTCOIN_WIDGET_LIMIT', false);
 
 实现在 `lib.php` 的 `ttcoin_format_price()`，**全程字符串 / 整数运算，不经过 `float`**。客户端只负责拼接，不再做任何格式化。
 
-早期版本是在手表端 `format("%0.4f")`，结果是 BTC 显示成 `75678.7812` —— Monkey C 的 `Float` 是 32 位，`75678.78` 存进去实际是 `75678.78125`，后两位纯属精度噪声。这个坑也写在 [`TTCoin_APP/docs/CODE_REVIEW.md`](https://github.com/__GH_OWNER__/TTCoin_APP/blob/main/docs/CODE_REVIEW.md) 的"踩坑记录"里。
+早期版本是在手表端 `format("%0.4f")`，结果是 BTC 显示成 `75678.7812` —— Monkey C 的 `Float` 是 32 位，`75678.78` 存进去实际是 `75678.78125`，后两位纯属精度噪声。这个坑也写在 [`TTCoin_APP/docs/CODE_REVIEW.md`](https://github.com/hh1949tt/TTCoin_APP/blob/main/docs/CODE_REVIEW.md) 的"踩坑记录"里。
 
 ⚠️ 例外：价格小于 `0.0001` 时 4 位会显示成 `0`——这类币由下一节的小额放大处理，不需要调大 `TTCOIN_MAX_DECIMALS`。
 
@@ -356,4 +356,17 @@ define('TTCOIN_DIAG_TOKEN', '你的一串随机字符（至少 16 位）');
 
 ## License
 
-见仓库根目录的 `LICENSE`。
+以 [PolyForm Noncommercial License 1.0.0](LICENSE) 发布，**仅限非商业用途**。版权归 `TTCoin contributors` 所有。
+
+| 可以 | 不可以 |
+| --- | --- |
+| 个人学习、研究、自用、改着玩 | **任何商业用途**：卖给客户、随硬件捆绑销售、公司内部业务系统、做成付费服务或订阅 |
+| 学校、慈善、政府、公共研究等非商业组织使用 | 拿本项目提供有偿技术支持、代部署或托管服务 |
+| 修改、二次开发、分发副本（须保留许可证与版权声明，并注明改动） | 删掉版权与许可证声明后当自己的作品发布 |
+
+一句话区分：**能看到源码 ≠ 可以商用**。这是 source-available，不是 OSI 认可的开源许可证。
+
+需要商用授权，到 [Issues](https://github.com/hh1949tt/TTCoin_API/issues) 说明用途即可。软件按"现状"提供，不含任何担保。
+
+This project is licensed under the PolyForm Noncommercial License 1.0.0.
+**Commercial use of any kind requires a separate written license.**
