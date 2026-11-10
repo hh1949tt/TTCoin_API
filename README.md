@@ -30,6 +30,7 @@
 | `cache/.htaccess` | 仓库占位：缓存目录（服务器上运行时生成）禁止外部访问 |
 | `logs/.htaccess` | 同上，针对请求日志目录 |
 | `config.example.php` | **配置示例**：数据目录、时区、Widget 精简开关、表盘显示、涨幅口径。复制成 `config.php` 才生效；不建也能跑（全走 `lib.php` 里的默认值） |
+| `admin.php` | 可选：网页后台，把全部配置项做成界面（含按 ID 配置的表格与实时预览）。**仅限本地 / 内网使用**，公网部署务必改名 + 强密码 + 访问限制，见「网页后台」一节 |
 | `worker/` | 可选：Cloudflare Workers 版实现（`worker.js` + `wrangler.toml`），输出契约与 `coin.php` 完全一致；上游在 Coinbase / Bybit 之间自动切换，`?diag=1` 可现场体检，见 [worker/README.md](worker/README.md) |
 
 ## 环境要求
@@ -128,6 +129,34 @@ curl -s https://your-domain.example/coin.php
 - 缓存与请求日志默认在站点目录的上一级（`../cache/coin.json`、`../logs/coin.log`）。若 docroot 恰好是那一级（如 `www` 为根、接口在 `www/ttcoin/`），它们仍在可访问范围内：Apache 下靠两个 `.htaccess` 兜底，**Nginx 下必须自己加** `location ^~ /ttcoin/cache/ { deny all; }` 之类（放在 PHP location 之前）；更彻底的办法是用 `TTCOIN_DATA_DIR` 把数据指到 docroot 之外，见上文「数据目录：缓存与日志放哪」；
 - 增加简单的来源/频率限制，防止接口被刷；
 - 若要对外开放给他人使用，请在 README 中明确写出你的服务可用性无承诺。
+
+### 6. （可选）网页后台 `admin.php`
+
+不想手改 PHP 配置时，浏览器打开 `admin.php` 即可：首次访问设置管理密码，之后所有
+`TTCOIN_*` 配置项都在界面上改，保存即生效，`coin.php` 一行都不用动。
+
+能改的东西：
+
+| 分组 | 内容 |
+| --- | --- |
+| 行情默认配置 | 滚屏 / 固定、轮播顺序（点选 + 调序）、固定币、条数上限、主币种（三端共用） |
+| 按 ID 配置 | 每个「行情配置 ID」一行，覆盖 mode / fixed / coin / topN / order；支持预览这一 ID 最终会下发哪几条 |
+| 客户端出口 | Widget 精简开关与条数、涨幅口径（24h / tz）与时区偏移 |
+| 缓存与上游 | 缓存有效期、旧缓存窗口、数据目录、日志时区、HTTP 代理、DNS 钉 IP、诊断密钥 |
+| 请求日志 | 尾部日志表格，未登记的 ID 标红带 `!`，按类型筛选 |
+
+存储方式：设置写在 `admin_settings.json`，`admin.php` 会生成一个只做 `define` 的
+`config.php` 桥接文件（JSON 里每个 `TTCOIN_` 键对应一条常量），所以 `coin.php` /
+`update_price.php` 里原有的 `require config.php` 逻辑完全不用改。第一次接管手写的
+`config.php` 时会自动备份成 `config.php.bak.<时间>`。
+
+**安全**：这个页面等于最高权限（能改代理、诊断密钥）。只在自己电脑或局域网用；
+真要放公网，至少把文件名改掉、设长密码、并在 Nginx / Apache 层加 IP 白名单或 Basic Auth。
+`admin_settings.json`、`admin_pass.php` 已在 `.gitignore` 和 `.htaccess` 里排除。
+
+> Cloudflare Worker 版也有同类后台：`worker.js` 内置 `/admin`，设置存 KV，
+> 保存后约 30 秒生效、不用重新 deploy。准备步骤见 `worker/README.md` 的
+> 「网页后台 `/admin`」一节（Worker 没有文件系统，所以没有请求日志页）。
 
 ## 接口约定
 

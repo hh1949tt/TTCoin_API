@@ -86,7 +86,12 @@ if (!defined('TTCOIN_RESOLVE')) {
 // 手表 60 秒才请求一次，10 秒足够吸收多设备并发与突发重试；
 // 若用 cron 预热（update_price.php），cron 间隔应 <= 此值，
 // 让手表请求基本都命中缓存、完全不触发上游调用。
-define('TTCOIN_CACHE_TTL', 10);
+//
+// 允许 config.php / 环境变量覆盖（admin.php 后台就是这么改的），
+// 所以这里用 defined 保护——否则 define 会重复，警告文本会混进 JSON 响应。
+if (!defined('TTCOIN_CACHE_TTL')) {
+    define('TTCOIN_CACHE_TTL', 10);
+}
 
 // 过期缓存最多还能"顶着用"多久（秒）。
 //
@@ -95,7 +100,9 @@ define('TTCOIN_CACHE_TTL', 10);
 // 再给一个更宽的窗口：只要缓存没超过这个年龄，就先把旧值返回，
 // 响应结束（fastcgi_finish_request）之后再在后台刷新。
 // 手表拿到的是最多 N 秒前的价格，但请求永远秒回。
-define('TTCOIN_STALE_SERVE', 600);
+if (!defined('TTCOIN_STALE_SERVE')) {
+    define('TTCOIN_STALE_SERVE', 600);
+}
 
 // 最多显示几位小数。上游给几位就显示几位（去掉尾部 0），
 // 只有超过这个位数才四舍五入。

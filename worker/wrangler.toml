@@ -59,3 +59,18 @@ LOG_REQUESTS = "1"
 # 可选：日志保留，排查 403 / 上游异常时有用（免费版也有 3 天）
 # [observability]
 # enabled = true
+
+# ---------------------------------------------------------------------------
+# 网页后台 /admin（可选，一次性设置）：
+#   ① 建一个 KV namespace，把输出的 id 填到下面并取消注释：
+#        npx wrangler kv namespace create SETTINGS
+#   ② 设置后台登录口令（不要写进本文件，secret 不进代码库）：
+#        npx wrangler secret put ADMIN_TOKEN
+#   ③ npx wrangler deploy → 浏览器打开 https://<你的 workers 域名>/admin
+# 后台改的配置存 KV（键 admin_settings），保存约 30 秒全局生效，无需重新
+# deploy；没绑 KV / 没设口令时行情出口完全不受影响（走上面 [vars] 默认）。
+# 注意：ADMIN_TOKEN 是后台最高权限（能改全部行情配置），口令务必够长。
+# ---------------------------------------------------------------------------
+# [[kv_namespaces]]
+# binding = "SETTINGS"
+# id = "<npx wrangler kv namespace create SETTINGS 输出的 id>"

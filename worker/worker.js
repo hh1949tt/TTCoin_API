@@ -39,7 +39,7 @@
  */
 
 // 币种基础符号。顺序即响应顺序（与 PHP 版 ttcoin_symbols() 一致）。
-const BASES = ['BTC', 'ETH', 'DOGE', 'SHIB', 'SOL', 'BNB', 'XRP', 'ADA', 'LINK', 'LTC', 'AVAX'];
+const BASES = ['BTC', 'ETH', 'DOGE', 'SOL', 'BNB', 'XRP', 'ADA', 'LINK', 'LTC', 'AVAX', 'SHIB'];
 
 const MAX_DECIMALS = 4;          // 常规价格最多 4 位小数
 const MAX_DECIMALS_SMALL = 7;    // 小额价格（小数位前面都是 0）放宽到 7 位
@@ -67,7 +67,7 @@ const WIDGET_TOP_N = 3;          // Widget 一屏 3 行
 // [{symbol,base,price,change}, ...]，多条就逐条轮播、一条就固定不动。
 // 输出契约不变，表盘端零改动。缓存里仍存完整列表，裁剪只发生在出口。
 const FACE_MODE = 'scroll';
-const FACE_ORDER = 'DOGE,BTC,ETH,SHIB,SOL,BNB,XRP,ADA,LINK,LTC,AVAX';
+const FACE_ORDER = 'DOGE,BTC,ETH,SOL,BNB,XRP,ADA,LINK,LTC,AVAX,SHIB';
 const FACE_FIXED = '';
 const FACE_TOP_N = 0;
 const FACE_COIN = '';
@@ -1024,7 +1024,18 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 网页后台（/admin）在最前面分发：后台流量不进行情缓存、不写请求日志。
+    // 设置存 KV（admin_settings 键），保存即生效，不用 wrangler deploy。
+    if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+      return handleAdmin(request, env, url);
+    }
+
     if (url.searchParams.get('diag') === '1') return runDiag(request, env);
+
+    // 把 KV 里保存的后台设置合并进 env（隔离实例内存缓存 30 秒，改配置后
+    // 最迟 30 秒全局生效）。之后 faceConfig / changeConfig / LOG_REQUESTS
+    // 读到的都是「KV 覆盖 wrangler.toml [vars]」的结果，下游代码零改动。
+    env = await effectiveEnv(env);
 
     // 三态白名单：face 是表盘版，出口有自己的滚屏 / 固定 + 币种顺序配置。
     // 请求可带 ?id=（手机端「行情配置 ID」）：FACE_IDS 登记了就按登记覆盖，
@@ -1170,4 +1181,810 @@ function trim(text, type, cfg) {
   } catch (e) {
     return out;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 网页后台（/admin）：配置存 KV，保存即生效（隔离实例缓存 30 秒内全局生效，
+// 无需 wrangler deploy）。一次性准备：
+//   1) npx wrangler kv namespace create SETTINGS   → 把返回的 id 填进 wrangler.toml
+//   2) npx wrangler secret put ADMIN_TOKEN         → 自定一个长口令（后台登录用）
+// 不绑 KV / 不设口令时行情出口完全不受影响，/admin 只会显示设置说明。
+// ---------------------------------------------------------------------------
+
+const ADMIN_KV_KEY = 'admin_settings';
+const ADMIN_COOKIE = 'ttcoin_admin';
+const ADMIN_SESSION_TTL = 7 * 86400;      // 登录态 7 天
+const ADMIN_KV_CACHE_TTL = 30000;         // 隔离实例内缓存 30 秒，控制 KV 读成本
+
+/** KV 设置的隔离实例缓存：{ data: 对象或 null, t: 加载时间 } */
+let adminKvCache = { data: null, t: 0 };
+
+/** 预览用的样本行情（价格递减便于一眼看清顺序，不回源）。 */
+const ADMIN_SAMPLE = JSON.stringify(
+  BASES.map((base, i) => ({ symbol: base, base: base, price: String(100 - i), change: '1.0' }))
+);
+
+/**
+ * 把 KV 里保存的设置合并进 env：返回新对象（不动原 env）。
+ * KV 值的约定：值为空字符串 = 不覆盖（envPick 会退回默认），
+ * 所以「恢复默认」只需要把对应键存成空串或删掉整个键。
+ */
+export async function effectiveEnv(env) {
+  const kv = env && env.SETTINGS;
+
+  if (!kv || typeof kv.get !== 'function') return env;
+
+  const now = Date.now();
+
+  if (adminKvCache.t && now - adminKvCache.t < ADMIN_KV_CACHE_TTL) {
+    return adminKvCache.data ? { ...env, ...adminKvCache.data } : env;
+  }
+
+  let data = null;
+
+  try {
+    const raw = await kv.get(ADMIN_KV_KEY);
+
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
+    }
+  } catch (e) {
+    data = null;   // 脏 JSON：当没保存过处理，行情出口走 wrangler.toml 默认
+  }
+
+  adminKvCache = { data: data, t: now };
+
+  return data ? { ...env, ...data } : env;
+}
+
+/** 后台登录口令（wrangler secret put ADMIN_TOKEN）。 */
+function adminToken(env) {
+  return String(envPick(env, 'ADMIN_TOKEN', '')).trim();
+}
+
+/** 登录态 = HMAC(口令) 截断值，口令本身不落 cookie。 */
+async function adminSig(token) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(token), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('ttcoin-admin-v1'));
+
+  return [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 40);
+}
+
+/** 恒定时间比较，避免逐字节比较的时序侧信道。 */
+function ctEqual(a, b) {
+  if (a.length !== b.length) return false;
+
+  let diff = 0;
+
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+
+  return diff === 0;
+}
+
+async function adminAuthed(request, env) {
+  const token = adminToken(env);
+
+  if (!token) return false;
+
+  const match = /(?:^|;\s*)ttcoin_admin=([0-9a-f]{40})(?:;|$)/
+    .exec(request.headers.get('Cookie') || '');
+
+  return !!match && ctEqual(match[1], await adminSig(token));
+}
+
+/** POST 一律校验 Origin（没有 Origin 头的算同源，如 curl 直调）。 */
+function adminSameOrigin(request) {
+  const origin = request.headers.get('Origin');
+
+  if (!origin) return true;
+
+  try {
+    return new URL(origin).host === new URL(request.url).host;
+  } catch (e) {
+    return false;
+  }
+}
+
+function adminJson(obj, status = 200, extra = {}) {
+  return new Response(JSON.stringify(obj), {
+    status: status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+  });
+}
+
+async function adminReadJson(request) {
+  try {
+    return await request.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 逗号分隔币种列表 → 去重校验；不支持的币返回 { ok:false, bad }。 */
+function adminCoinList(raw) {
+  const parts = String(raw === undefined || raw === null ? '' : raw)
+    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const list = [];
+
+  for (const part of parts) {
+    if (!BASES.includes(part)) return { ok: false, bad: part };
+    if (!list.includes(part)) list.push(part);
+  }
+
+  return { ok: true, list: list };
+}
+
+/**
+ * 校验并清洗后台提交的设置。与 PHP 版 admin_validate() 同一套规则：
+ * 只收「非空且合法」的键（空 = 不覆盖 = 走默认），FACE_IDS 存回 JSON 字符串。
+ */
+export function adminValidate(input) {
+  const errors = [];
+  const warnings = [];
+  const clean = {};
+  const src = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const str = key => src[key] === undefined || src[key] === null ? '' : String(src[key]).trim();
+
+  const mode = str('FACE_MODE').toLowerCase();
+  if (mode && mode !== 'scroll' && mode !== 'fixed') {
+    errors.push('FACE_MODE 只能是 scroll 或 fixed');
+  } else if (mode) {
+    clean.FACE_MODE = mode;
+  }
+
+  const order = adminCoinList(str('FACE_ORDER'));
+  if (!order.ok) {
+    errors.push('FACE_ORDER 里有不支持的币种：' + order.bad + '（支持：' + BASES.join(',') + '）');
+  } else if (order.list.length) {
+    clean.FACE_ORDER = order.list.join(',');
+  }
+
+  const fixed = str('FACE_FIXED').toUpperCase();
+  if (fixed && !BASES.includes(fixed)) {
+    errors.push('FACE_FIXED 必须是 ' + BASES.join('/') + ' 之一');
+  } else if (fixed) {
+    clean.FACE_FIXED = fixed;
+  }
+
+  const topN = str('FACE_TOP_N');
+  if (topN !== '') {
+    const n = Number.parseInt(topN, 10);
+    if (!Number.isInteger(n) || n < 0 || n > BASES.length) {
+      errors.push('FACE_TOP_N 必须是 0~' + BASES.length + ' 的整数（0 = 按 ORDER 全给）');
+    } else {
+      clean.FACE_TOP_N = String(n);
+    }
+  }
+
+  const coin = adminCoinList(str('FACE_COIN'));
+  if (!coin.ok) {
+    errors.push('FACE_COIN（主币种）里有不支持的币种：' + coin.bad);
+  } else if (coin.list.length) {
+    clean.FACE_COIN = coin.list.join(',');
+  }
+
+  const changeMode = str('CHANGE_MODE').toLowerCase();
+  if (changeMode && changeMode !== '24h' && changeMode !== 'tz') {
+    errors.push('CHANGE_MODE 只能是 24h 或 tz');
+  } else if (changeMode) {
+    clean.CHANGE_MODE = changeMode;
+  }
+
+  const tz = str('CHANGE_TZ');
+  if (tz && !normalizeTz(tz)) {
+    errors.push('CHANGE_TZ 不是合法的 UTC 偏移（示例：8 / 0 / -5 / 5:30）');
+  } else if (tz) {
+    clean.CHANGE_TZ = tz;
+  }
+
+  const logReq = str('LOG_REQUESTS');
+  if (logReq && logReq !== '0' && logReq !== '1') {
+    errors.push('LOG_REQUESTS 只能是 0 或 1');
+  } else if (logReq) {
+    clean.LOG_REQUESTS = logReq;
+  }
+
+  // —— FACE_IDS：键限 32 位字母数字，行内 mode/fixed/coin/topN/order 逐项校验 ——
+  let idsIn = src.FACE_IDS;
+
+  if (typeof idsIn === 'string') {
+    try {
+      idsIn = JSON.parse(idsIn || '{}');
+    } catch (e) {
+      idsIn = { __bad: true };
+    }
+  }
+
+  if (idsIn === null || idsIn === undefined || idsIn === '') idsIn = {};
+
+  if (idsIn.__bad || Array.isArray(idsIn) || typeof idsIn !== 'object') {
+    errors.push('FACE_IDS 不是合法的 JSON 对象');
+  } else {
+    const ids = {};
+
+    for (const [key, value] of Object.entries(idsIn)) {
+      const id = String(key).replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+
+      if (!id) continue;   // 空 ID 行直接丢弃
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+
+      const one = {};
+      let bad = false;
+
+      const m = String(value.mode || '').trim().toLowerCase();
+      if (m && m !== 'scroll' && m !== 'fixed') {
+        errors.push('ID ' + id + ' 的 mode 只能是 scroll / fixed'); bad = true;
+      } else if (m) {
+        one.mode = m;
+      }
+
+      const fx = String(value.fixed || '').trim().toUpperCase();
+      if (fx && !BASES.includes(fx)) {
+        errors.push('ID ' + id + ' 的 fixed 币种不支持：' + fx); bad = true;
+      } else if (fx) {
+        one.fixed = fx;
+      }
+
+      const cn = adminCoinList(value.coin);
+      if (!cn.ok) {
+        errors.push('ID ' + id + ' 的 coin 有不支持的币种：' + cn.bad); bad = true;
+      } else if (cn.list.length) {
+        one.coin = cn.list.join(',');
+      }
+
+      if (value.topN !== undefined && value.topN !== null && String(value.topN).trim() !== '') {
+        const n = Number.parseInt(value.topN, 10);
+        if (!Number.isInteger(n) || n < 0 || n > BASES.length) {
+          errors.push('ID ' + id + ' 的 topN 必须是 0~' + BASES.length); bad = true;
+        } else {
+          one.topN = n;
+        }
+      }
+
+      const od = adminCoinList(value.order);
+      if (!od.ok) {
+        errors.push('ID ' + id + ' 的 order 有不支持的币种：' + od.bad); bad = true;
+      } else if (od.list.length) {
+        one.order = od.list.join(',');
+      }
+
+      if (!bad && Object.keys(one).length) ids[id] = one;
+    }
+
+    if (Object.keys(ids).length) clean.FACE_IDS = JSON.stringify(ids);
+
+    // 与 PHP 版同一个坑：全局主币种（coin）优先级高于行内 fixed
+    if (clean.FACE_COIN) {
+      for (const [id, one] of Object.entries(ids)) {
+        if (one.fixed && !one.coin) {
+          warnings.push(
+            'ID ' + id + '：全局主币种（' + clean.FACE_COIN + '）优先于行内 fixed，' +
+            '其 fixed=' + one.fixed + ' 会被顶掉；要固定 ' + one.fixed +
+            ' 请给该行同时填 coin=' + one.fixed
+          );
+        }
+      }
+    }
+  }
+
+  return { clean: clean, errors: errors, warnings: warnings };
+}
+
+/** 后台各入口的分发。 */
+async function handleAdmin(request, env, url) {
+  const path = url.pathname.replace(/\/+$/, '') || '/admin';
+  const token = adminToken(env);
+  const hasKv = !!(env && env.SETTINGS && typeof env.SETTINGS.get === 'function');
+  const method = request.method;
+
+  if (method !== 'GET' && method !== 'POST') return adminJson({ ok: false, message: 'method' }, 405);
+  if (method === 'POST' && !adminSameOrigin(request)) {
+    return adminJson({ ok: false, message: 'Origin 校验失败' }, 403);
+  }
+
+  if (path === '/admin' && method === 'GET') {
+    return new Response(adminPage(), {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Robots-Tag': 'noindex',
+      },
+    });
+  }
+
+  if (path === '/admin/api/state' && method === 'GET') {
+    return adminJson({
+      ok: true,
+      tokenSet: !!token,
+      kvBound: hasKv,
+      authed: token ? await adminAuthed(request, env) : false,
+    });
+  }
+
+  if (path === '/admin/api/login' && method === 'POST') {
+    if (!token) return adminJson({ ok: false, message: '未设置 ADMIN_TOKEN（wrangler secret put ADMIN_TOKEN）' }, 400);
+
+    const body = await adminReadJson(request);
+    const input = String((body && body.token) || '').trim();
+
+    if (!input || input !== token) return adminJson({ ok: false, message: '口令不对' }, 401);
+
+    return adminJson({ ok: true }, 200, {
+      'Set-Cookie': ADMIN_COOKIE + '=' + (await adminSig(token)) +
+        '; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=' + ADMIN_SESSION_TTL,
+    });
+  }
+
+  if (path === '/admin/api/logout' && method === 'POST') {
+    return adminJson({ ok: true }, 200, {
+      'Set-Cookie': ADMIN_COOKIE + '=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+    });
+  }
+
+  // —— 以下接口都要登录 ——
+  if (!token) return adminJson({ ok: false, message: '未设置 ADMIN_TOKEN' }, 400);
+  if (!(await adminAuthed(request, env))) return adminJson({ ok: false, message: '未登录' }, 401);
+
+  if (path === '/admin/api/settings' && method === 'GET') {
+    const merged = await effectiveEnv(env);
+    let saved = null;
+
+    try {
+      const raw = await env.SETTINGS.get(ADMIN_KV_KEY);
+      if (raw) saved = JSON.parse(raw);
+    } catch (e) {
+      saved = null;
+    }
+
+    let ids = {};
+
+    try {
+      ids = JSON.parse(String(envPick(merged, 'FACE_IDS', FACE_IDS))) || {};
+    } catch (e) {
+      ids = {};
+    }
+
+    return adminJson({
+      ok: true,
+      values: {
+        FACE_MODE: String(envPick(merged, 'FACE_MODE', FACE_MODE)).trim().toLowerCase(),
+        FACE_ORDER: String(envPick(merged, 'FACE_ORDER', FACE_ORDER)),
+        FACE_FIXED: String(envPick(merged, 'FACE_FIXED', FACE_FIXED)).trim().toUpperCase(),
+        FACE_TOP_N: String(envPick(merged, 'FACE_TOP_N', FACE_TOP_N)),
+        FACE_COIN: String(envPick(merged, 'FACE_COIN', FACE_COIN)).trim().toUpperCase(),
+        CHANGE_MODE: String(envPick(merged, 'CHANGE_MODE', CHANGE_MODE)).trim().toLowerCase(),
+        CHANGE_TZ: String(envPick(merged, 'CHANGE_TZ', CHANGE_TZ)),
+        LOG_REQUESTS: String(envPick(merged, 'LOG_REQUESTS', '1')),
+      },
+      ids: ids,
+      savedKeys: saved && typeof saved === 'object' ? Object.keys(saved) : [],
+    });
+  }
+
+  if (path === '/admin/api/save' && method === 'POST') {
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV（wrangler kv namespace create SETTINGS）' }, 400);
+
+    const body = await adminReadJson(request);
+    const result = adminValidate(body && body.settings);
+
+    if (result.errors.length) {
+      return adminJson({ ok: false, message: '有 ' + result.errors.length + ' 项没通过校验', errors: result.errors }, 400);
+    }
+
+    const kv = env.SETTINGS;
+
+    if (Object.keys(result.clean).length) {
+      await kv.put(ADMIN_KV_KEY, JSON.stringify(result.clean));
+    } else {
+      await kv.delete(ADMIN_KV_KEY);   // 全部清空 = 整体恢复 wrangler.toml 默认
+    }
+
+    try {
+      const raw = await kv.get(ADMIN_KV_KEY);
+      adminKvCache = { data: raw ? JSON.parse(raw) : null, t: Date.now() };
+    } catch (e) {
+      adminKvCache = { data: null, t: 0 };
+    }
+
+    return adminJson({
+      ok: true,
+      message: Object.keys(result.clean).length
+        ? '已保存，约 30 秒内全局生效（无需重新部署）'
+        : '设置已清空，全部恢复 wrangler.toml 默认',
+      warnings: result.warnings,
+    });
+  }
+
+  if (path === '/admin/api/reset' && method === 'POST') {
+    if (hasKv) {
+      await env.SETTINGS.delete(ADMIN_KV_KEY);
+      adminKvCache = { data: null, t: Date.now() };
+    }
+
+    return adminJson({ ok: true, message: '已恢复 wrangler.toml 默认配置' });
+  }
+
+  if (path === '/admin/api/preview' && method === 'POST') {
+    const body = await adminReadJson(request);
+    let cand = null;
+    let warnings = [];
+
+    if (body && body.settings && typeof body.settings === 'object') {
+      const result = adminValidate(body.settings);
+
+      if (result.errors.length) {
+        return adminJson({ ok: false, message: '有 ' + result.errors.length + ' 项没通过校验', errors: result.errors }, 400);
+      }
+
+      cand = result.clean;
+      warnings = result.warnings;
+    } else {
+      const merged = await effectiveEnv(env);
+
+      cand = {
+        FACE_MODE: envPick(merged, 'FACE_MODE', FACE_MODE),
+        FACE_ORDER: envPick(merged, 'FACE_ORDER', FACE_ORDER),
+        FACE_FIXED: envPick(merged, 'FACE_FIXED', FACE_FIXED),
+        FACE_TOP_N: envPick(merged, 'FACE_TOP_N', FACE_TOP_N),
+        FACE_COIN: envPick(merged, 'FACE_COIN', FACE_COIN),
+        FACE_IDS: envPick(merged, 'FACE_IDS', FACE_IDS),
+      };
+    }
+
+    const id = String((body && body.id) || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+    const cfg = faceConfig(cand, id);
+    const out = JSON.parse(faceOutput(ADMIN_SAMPLE, cfg) || '[]');
+    const host = url.host;
+
+    return adminJson({
+      ok: true,
+      id: id,
+      known: cfg.idKnown,
+      config: { mode: cfg.mode, fixed: cfg.fixed, topN: cfg.topN, coin: cfg.coin, order: cfg.order.join(',') },
+      count: out.length,
+      coins: out.map(item => item.symbol),
+      warnings: warnings,
+      curl: 'curl -sD - "https://' + host + '/coin.php?type=face' + (id ? '&id=' + id : '') + '"',
+    });
+  }
+
+  return adminJson({ ok: false, message: 'not found' }, 404);
+}
+
+/** 后台页面：骨架 + 前端脚本，状态由 /admin/api/state 驱动。 */
+function adminPage() {
+  const state = JSON.stringify({ bases: BASES }).replace(/<\//g, '<\\/');
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TTCoin Worker 后台</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#e2e7ec;--text:#1c2733;--muted:#6b7a89;--accent:#0b7285;--ok:#0b5f59;--bad:#a61e4d;--warn:#946c00}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:24px 16px 80px}
+.wrap{max-width:900px;margin:0 auto}
+h1{font-size:19px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:12.5px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px}
+label{display:block;font-size:12.5px;color:var(--muted);margin:10px 0 4px}
+input[type=text],input[type=password],input[type=number],select{width:100%;max-width:340px;padding:7px 10px;border:1px solid var(--line);border-radius:7px;font:inherit;background:#fff;color:var(--text)}
+input[type=number]{max-width:110px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.hint{font-size:12px;color:var(--muted);margin-top:6px}
+code{background:#eef2f5;padding:1px 5px;border-radius:4px;font-size:12px}
+button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--text);border-radius:7px;padding:7px 14px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{opacity:.9;color:#fff}
+button.tiny{padding:2px 8px;font-size:12px}
+button:disabled{opacity:.5;cursor:default}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 12px;font-size:13px;cursor:pointer;user-select:none;background:#fff}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.chip .ord{font-size:11px;opacity:.85;margin-right:4px}
+table{border-collapse:collapse;width:100%}
+th,td{border-bottom:1px solid var(--line);padding:6px 6px;font-size:12.5px;text-align:left;vertical-align:middle}
+th{color:var(--muted);font-weight:600;white-space:nowrap}
+td input,td select{max-width:none;padding:5px 8px}
+td .num{max-width:70px}
+.msg{padding:9px 12px;border-radius:8px;font-size:13px;margin:10px 0;display:none}
+.msg.ok{background:#e6f4f1;color:var(--ok);display:block}
+.msg.bad{background:#fbe9ef;color:var(--bad);display:block}
+.msg.warn{background:#fdf6e3;color:var(--warn);display:block;white-space:pre-line}
+ul{margin:6px 0 0;padding-left:18px}
+.preview{background:#10222b;color:#d8e6ee;border-radius:8px;padding:10px 12px;font:12px/1.7 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;display:none}
+.saved{font-size:12px;color:var(--muted)}
+@media(max-width:640px){td,th{padding:5px 4px}.card{padding:12px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TTCoin Worker 后台</h1>
+  <div class="sub">配置存 Cloudflare KV，保存后约 30 秒全局生效，无需 wrangler deploy<span id="savedInfo" class="saved"></span></div>
+
+  <div id="msg" class="msg"></div>
+
+  <div id="setup" class="card" style="display:none">
+    <h2>首次设置（一次性）</h2>
+    <div id="setupBody"></div>
+  </div>
+
+  <div id="login" class="card" style="display:none">
+    <h2>登录</h2>
+    <label>管理口令（ADMIN_TOKEN）</label>
+    <input type="password" id="pass" placeholder="wrangler secret put ADMIN_TOKEN 时设置的那个">
+    <div class="row" style="margin-top:12px"><button class="primary" id="loginBtn">登录</button></div>
+  </div>
+
+  <div id="main" style="display:none">
+    <div class="card">
+      <h2>行情默认配置（三端共用）</h2>
+      <label>模式</label>
+      <div class="row">
+        <label class="chip" style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="radio" name="mode" value="scroll">scroll 滚屏</label>
+        <label class="chip" style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="radio" name="mode" value="fixed">fixed 固定</label>
+      </div>
+      <label>固定币（fixed 模式生效）</label>
+      <select id="fixed"></select>
+      <label>滚屏顺序（点选顺序 = 轮播顺序，再点一次取消）</label>
+      <div class="chips" id="orderChips"></div>
+      <div class="hint">全不勾 = 不覆盖，走 wrangler.toml 的 FACE_ORDER</div>
+      <div class="row" style="margin-top:8px">
+        <div style="white-space:nowrap"><label>条数上限（scroll）</label><input type="number" id="topn" min="0" max="11" placeholder="0" style="display:inline-block;vertical-align:middle"> <span class="hint" style="display:inline;margin:0">0 = 按 ORDER 全给</span></div>
+      </div>
+      <label>主币种 coin（三端共用，逗号分隔多币优先级，如 BTC,ETH；留空 = 默认币种）</label>
+      <input type="text" id="coin" placeholder="留空 = 不覆盖">
+      <div class="hint">注意：coin 优先于行内 fixed——全局配了 coin，按 ID 行里只写 fixed 会被顶掉</div>
+    </div>
+
+    <div class="card">
+      <h2>涨幅与日志</h2>
+      <label>涨幅口径</label>
+      <div class="row">
+        <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="radio" name="chg" value="24h">24h（滚动 24 小时）</label>
+        <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="radio" name="chg" value="tz">tz（指定时区自然日）</label>
+      </div>
+      <div class="row"><div><label>时区偏移（tz 模式）</label><input type="text" id="tz" placeholder="8 / 0 / -5 / 5:30" style="max-width:140px"></div>
+      <div><label>请求日志</label><select id="logreq" style="max-width:120px"><option value="1">开（wrangler tail 可看）</option><option value="0">关</option></select></div></div>
+    </div>
+
+    <div class="card">
+      <h2>按 ID 配置（?id= 登记了才覆盖默认一套）</h2>
+      <table id="idsTable"><thead><tr>
+        <th>ID（≤32 位）</th><th>模式</th><th>固定币</th><th>主币种</th><th>条数</th><th>顺序</th><th></th>
+      </tr></thead><tbody></tbody></table>
+      <div class="row" style="margin-top:10px"><button id="addId">+ 添加 ID</button></div>
+      <div class="hint">留空的项 = 不覆盖；整行都空 = 只做登记（日志里不再标 unknown）</div>
+    </div>
+
+    <div class="card">
+      <h2>预览（保存前可先试算）</h2>
+      <div class="row">
+        <input type="text" id="pvId" placeholder="行情配置 ID（留空 = 默认一套）" style="max-width:280px">
+        <button id="pvCur">预览当前生效</button>
+        <button id="pvDraft">预览表单草稿</button>
+      </div>
+      <div class="preview" id="pvOut"></div>
+    </div>
+
+    <div class="row" style="margin-top:4px">
+      <button class="primary" id="saveBtn">保存</button>
+      <button id="resetBtn">恢复 wrangler.toml 默认</button>
+      <button id="logoutBtn" style="margin-left:auto">退出登录</button>
+    </div>
+  </div>
+</div>
+<script>
+const CFG = ${state};
+const API = location.pathname.replace(/\\/+$/, '') + '/api/';
+const $ = id => document.getElementById(id);
+let state = null;
+
+function show(el, on){ el.style.display = on ? '' : 'none'; }
+function msg(text, cls){
+  const el = $('msg');
+  el.textContent = text || '';
+  el.className = 'msg' + (cls ? ' ' + cls : '');
+  if (!text) el.className = 'msg';
+}
+async function post(name, body, method){
+  const m = method || 'POST';
+  const init = { method: m, headers: { 'Content-Type': 'application/json' } };
+  // GET 不允许带 body（浏览器会直接抛 TypeError），只有非 GET 才序列化
+  if (m !== 'GET' && body !== undefined && body !== null) init.body = JSON.stringify(body);
+  const r = await fetch(API + name, init);
+  let j = null;
+  try { j = await r.json(); } catch (e) { j = { ok: false, message: 'HTTP ' + r.status }; }
+  return j;
+}
+function baseOptions(sel, placeholder){
+  sel.innerHTML = '<option value="">' + placeholder + '</option>' +
+    CFG.bases.map(b => '<option value="' + b + '">' + b + '</option>').join('');
+}
+function fixedSel(){ return document.querySelector('input[name=mode]:checked').value; }
+
+// —— 顺序 chips：**点选顺序即轮播顺序**（先点的排前面），再点一次取消 ——
+// 注意：已选的 chip 必须按「已选顺序」排在最前，否则读回来永远是 BASES 顺序
+function renderOrderChips(selected){
+  const box = $('orderChips');
+  box.innerHTML = '';
+  const ordered = selected.filter(b => CFG.bases.includes(b));
+  const rest = CFG.bases.filter(b => !ordered.includes(b));
+
+  const addChip = (base, idx) => {
+    const chip = document.createElement('span');
+    chip.className = 'chip' + (idx ? ' on' : '');
+    chip.innerHTML = (idx ? '<span class="ord">' + idx + '</span>' : '') + base;
+    chip.onclick = () => {
+      if (idx) renderOrderChips(ordered.filter(b => b !== base));
+      else renderOrderChips(ordered.concat([base]));
+    };
+    box.appendChild(chip);
+  };
+
+  ordered.forEach((base, i) => addChip(base, i + 1));
+  rest.forEach(base => addChip(base, 0));
+}
+function currentOrder(){
+  const out = [];
+  document.querySelectorAll('#orderChips .chip.on').forEach(chip => {
+    out.push(chip.textContent.replace(/^\\d+/, ''));
+  });
+  return out;
+}
+
+
+function idRow(one){
+  const tr = document.createElement('tr');
+  const opt = (list, cur) => list.map(b => '<option value="' + b + '"' + (b === cur ? ' selected' : '') + '>' + b + '</option>').join('');
+  const sel = (cur) => '<option value=""></option><option value="scroll"' + (cur === 'scroll' ? ' selected' : '') + '>scroll</option><option value="fixed"' + (cur === 'fixed' ? ' selected' : '') + '>fixed</option>';
+  const fx = one.fixed || '', cn = one.coin || '', od = one.order || '';
+  tr.innerHTML =
+    '<td><input type="text" class="i-id" value="' + (one.__id || '') + '" maxlength="32" placeholder="TC…"></td>' +
+    '<td><select class="i-mode">' + sel(one.mode) + '</select></td>' +
+    '<td><select class="i-fixed"><option value=""></option>' + opt(CFG.bases, fx) + '</select></td>' +
+    '<td><input type="text" class="i-coin" value="' + cn + '" placeholder="BTC,ETH"></td>' +
+    '<td><input type="number" class="i-topn num" min="0" max="11" value="' + (one.topN === undefined || one.topN === null ? '' : one.topN) + '"></td>' +
+    '<td><input type="text" class="i-order" value="' + od + '" placeholder="留空=继承"></td>' +
+    '<td style="white-space:nowrap"><button type="button" class="tiny pv">预览</button> <button type="button" class="tiny del">×</button></td>';
+  tr.querySelector('.del').onclick = () => tr.remove();
+  tr.querySelector('.pv').onclick = () => preview({ settings: collect(), id: tr.querySelector('.i-id').value });
+  return tr;
+}
+function renderIds(ids){
+  const tbody = $('idsTable').querySelector('tbody');
+  tbody.innerHTML = '';
+  Object.entries(ids || {}).forEach(([id, one]) => tbody.appendChild(idRow(Object.assign({}, one, { __id: id }))));
+}
+function collectIds(){
+  const ids = {};
+  document.querySelectorAll('#idsTable tbody tr').forEach(tr => {
+    const id = tr.querySelector('.i-id').value.replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+    if (!id) return;
+    const one = {};
+    const mode = tr.querySelector('.i-mode').value, fx = tr.querySelector('.i-fixed').value;
+    const cn = tr.querySelector('.i-coin').value.trim(), od = tr.querySelector('.i-order').value.trim();
+    const tn = tr.querySelector('.i-topn').value.trim();
+    if (mode) one.mode = mode;
+    if (fx) one.fixed = fx;
+    if (cn) one.coin = cn;
+    if (od) one.order = od;
+    if (tn !== '') one.topN = parseInt(tn, 10);
+    if (Object.keys(one).length) ids[id] = one;
+  });
+  return ids;
+}
+function collect(){
+  const order = currentOrder();
+  return {
+    FACE_MODE: fixedSel(),
+    FACE_FIXED: $('fixed').value,
+    FACE_ORDER: order.join(','),
+    FACE_TOP_N: $('topn').value.trim(),
+    FACE_COIN: $('coin').value.trim(),
+    CHANGE_MODE: document.querySelector('input[name=chg]:checked').value,
+    CHANGE_TZ: $('tz').value.trim(),
+    LOG_REQUESTS: $('logreq').value,
+    FACE_IDS: collectIds(),
+  };
+}
+function fill(values, ids){
+  document.querySelectorAll('input[name=mode]').forEach(r => r.checked = r.value === values.FACE_MODE);
+  baseOptions($('fixed'), '（留空 = ORDER 第一项）');
+  $('fixed').value = values.FACE_FIXED || '';
+  renderOrderChips(String(values.FACE_ORDER || '').split(',').map(s => s.trim()).filter(Boolean));
+  $('topn').value = values.FACE_TOP_N || '';
+  $('coin').value = values.FACE_COIN || '';
+  document.querySelectorAll('input[name=chg]').forEach(r => r.checked = r.value === values.CHANGE_MODE);
+  $('tz').value = values.CHANGE_TZ || '';
+  $('logreq').value = values.LOG_REQUESTS === '0' ? '0' : '1';
+  renderIds(ids || {});
+}
+
+async function preview(body){
+  const out = $('pvOut');
+  // 注意：.preview 类在样式表里是 display:none，必须用行内样式 'block' 覆盖，
+  // 不能用 show(out, true)（它清空行内样式，会回落回 CSS 的 none）
+  out.style.display = 'block';
+  try {
+    const j = await post('preview', body || {});
+    if (!j.ok) { out.textContent = (j.errors || [j.message || '预览失败']).join('\\n'); return; }
+    const lines = [];
+    lines.push('id=' + (j.id || '(默认一套)') + '  known=' + (j.known ? '已登记' : '未登记(走默认)'));
+    lines.push('mode=' + j.config.mode + '  fixed=' + (j.config.fixed || '-') + '  topN=' + j.config.topN + '  coin=' + (j.config.coin || '-'));
+    lines.push('order=' + j.config.order);
+    lines.push('输出 ' + j.count + ' 条：' + j.coins.join(' → '));
+    if (j.warnings && j.warnings.length) lines.push('⚠ ' + j.warnings.join('\\n⚠ '));
+    lines.push(j.curl);
+    out.textContent = lines.join('\\n');
+  } catch (e) {
+    out.textContent = '预览请求失败：' + (e && e.message ? e.message : e);
+  }
+}
+
+async function boot(){
+  const s = await post('state', null, 'GET');
+  if (!s.ok) { msg('状态读取失败', 'bad'); return; }
+  state = s;
+  show($('setup'), !s.tokenSet || !s.kvBound);
+  if (!s.tokenSet || !s.kvBound) {
+    const steps = [];
+    if (!s.kvBound) steps.push('① 绑定 KV：<code>npx wrangler kv namespace create SETTINGS</code>，把输出的 id 填进 wrangler.toml 的 <code>[[kv_namespaces]]</code>，再 <code>npx wrangler deploy</code>');
+    if (!s.tokenSet) steps.push('② 设置登录口令：<code>npx wrangler secret put ADMIN_TOKEN</code>（输入一个长口令）');
+    $('setupBody').innerHTML = '<ul><li style="margin:6px 0">' + steps.join('</li><li style="margin:6px 0">') + '</li></ul><div class="hint">没设置完之前行情出口不受影响（走 wrangler.toml 默认）。</div>';
+    return;
+  }
+  show($('login'), !s.authed);
+  show($('main'), s.authed);
+  if (!s.authed) return;
+  const cfg = await post('settings', null, 'GET');
+  if (cfg.ok) {
+    fill(cfg.values, cfg.ids);
+    $('savedInfo').textContent = cfg.savedKeys.length ? ' · 已覆盖 ' + cfg.savedKeys.length + ' 项' : ' · 当前全部走 wrangler.toml 默认';
+  }
+  baseOptions($('fixed'), '（留空 = ORDER 第一项）');
+}
+
+$('loginBtn').onclick = async () => {
+  const j = await post('login', { token: $('pass').value });
+  if (j.ok) { msg('已登录', 'ok'); boot(); } else msg(j.message || '登录失败', 'bad');
+};
+$('pass').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+$('addId').onclick = () => document.querySelector('#idsTable tbody').appendChild(idRow({}));
+
+$('pvCur').onclick = () => preview({ id: $('pvId').value });
+$('pvDraft').onclick = () => preview({ settings: collect(), id: $('pvId').value });
+
+$('saveBtn').onclick = async () => {
+  const btn = $('saveBtn');
+  btn.disabled = true;
+  const j = await post('save', { settings: collect() });
+  btn.disabled = false;
+  if (j.ok) {
+    msg(j.message + ((j.warnings || []).length ? '\\n⚠ ' + j.warnings.join('\\n⚠ ') : ''), j.warnings && j.warnings.length ? 'warn' : 'ok');
+    boot();
+  } else {
+    msg((j.errors || [j.message]).map(e => '· ' + e).join('\\n'), 'bad');
+  }
+};
+$('resetBtn').onclick = async () => {
+  if (!confirm('清空 KV 里保存的全部设置，恢复 wrangler.toml 默认？')) return;
+  const j = await post('reset');
+  if (j.ok) { msg(j.message, 'ok'); boot(); } else msg(j.message || '失败', 'bad');
+};
+$('logoutBtn').onclick = async () => { await post('logout'); show($('main'), false); show($('login'), true); msg('已退出', 'ok'); };
+
+// 首次加载失败也要给出可见提示，避免只看到一个标题的白页
+boot().catch(e => msg('初始化失败：' + (e && e.message ? e.message : e), 'bad'));
+</script>
+</body>
+</html>`;
 }

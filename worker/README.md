@@ -224,6 +224,38 @@ curl -s  'http://127.0.0.1:8787/coin.php?diag=1'   # 末尾会打印 face 配置
 想临时切固定显示，改 `wrangler.toml` 的 `FACE_MODE = "fixed"`（或本地放一份
 `.dev.vars` 覆盖同名变量），不用动 `worker.js`。
 
+## 网页后台 `/admin`（可选）
+
+不想每次改配置都 `wrangler deploy` 的话，Worker 内置了一个网页后台：浏览器打开
+`https://<你的 workers 域名>/admin`，登录后可视化管理全部行情配置——滚屏 / 固定
+模式、轮播顺序、固定币、条数上限、主币种 coin、涨幅口径与时区、日志开关，以及
+**按 ID 配置表格**（每行可单独覆盖 mode / fixed / coin / topN / order，行内还有
+「预览」按钮直接试算该 ID 的输出），保存前可用「预览表单草稿」先看结果。
+
+设置存在 **Cloudflare KV**（键 `admin_settings`），保存后约 30 秒全局生效
+（隔离实例内缓存 30 秒），**无需重新 deploy**；`wrangler.toml [vars]` 退化为
+默认值，「恢复默认」一键清空 KV 即可回到 `[vars]` 那一套。
+
+一次性准备（两步，都在 `worker/` 目录下执行）：
+
+```bash
+npx wrangler kv namespace create SETTINGS   # 把输出的 id 填进 wrangler.toml 的 [[kv_namespaces]]（已备好注释模板）
+npx wrangler secret put ADMIN_TOKEN         # 自定一个长口令，这是后台登录凭据
+npx wrangler deploy                          # KV 绑定随部署生效
+```
+
+安全设计：登录态是 `HMAC(ADMIN_TOKEN)` 的签名 cookie（口令本身不落 cookie，
+HttpOnly + Secure + SameSite=Strict，7 天有效）；全部 POST 校验 Origin；
+未登录访问设置接口一律 401。没绑 KV / 没设口令时后台只显示设置说明，
+**行情出口完全不受影响**。
+
+两个和 PHP 版 admin.php 的差异要提前知道：
+
+- **请求日志页没有**：Worker 没有文件系统，日志只能 `npx wrangler tail` /
+  Workers Logs 看（或接 Analytics Engine，计费项）。后台能做的是配置管理。
+- **KV 免费额度**：每天 10 万次读、1000 次写。读有 30 秒隔离缓存兜底，
+  写只在保存时发生，个人使用毫无压力。
+
 ## 已知限制
 
 - **免费额度 10 万请求/天**。手表每分钟刷新一次 = 1440 次/天/设备，几十台设备毫无压力；一旦超了，额度按 UTC 零点重置。
