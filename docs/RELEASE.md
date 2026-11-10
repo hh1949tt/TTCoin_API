@@ -26,7 +26,7 @@
 
 ## 2. 发布物清单
 
-站点目录（示例 `/var/www/www/ttcoin`）应包含：
+站点目录（示例 `/vol2/1000/Docker/web_out/www/ttcoin`）应包含：
 
 | 文件 | 必须 | 职责 |
 | --- | --- | --- |
@@ -85,19 +85,19 @@ php -l coin.php && php -l lib.php && php -l update_price.php
 <?php
 // 站点目录下 config.php
 define('TTCOIN_DATA_DIR', __DIR__);      // 落在 ttcoin/cache、ttcoin/logs
-// define('TTCOIN_DATA_DIR', '/var/www/data');   // 或放 docroot 之外
+// define('TTCOIN_DATA_DIR', '/vol2/1000/Docker/web_out/data');   // 或放 docroot 之外
 ```
 
 ```yaml
 # 或走容器环境变量
 environment:
-  TTCOIN_DATA_DIR: /var/www/data
+  TTCOIN_DATA_DIR: /vol2/1000/Docker/web_out/data
 ```
 
 权限：容器内 PHP 进程属主（Alpine 常见 `nginx`/`82`，Debian 系 `www-data`）要能写该目录：
 
 ```bash
-chown -R www-data:www-data /var/www/www/ttcoin
+chown -R www-data:www-data /vol2/1000/Docker/web_out/www/ttcoin
 ```
 
 ### 4.3 Nginx 必须补的两条（Docker 部署）
@@ -131,14 +131,14 @@ cron 间隔应 ≤ `TTCOIN_CACHE_TTL`（默认 10s），否则表端仍会命中
 | `TTCOIN_DATA_DIR` | `dirname(__DIR__)` | 缓存 / 日志父目录 |
 | `TTCOIN_TIMEZONE` | `Asia/Shanghai` | 日志时间戳时区 |
 | `TTCOIN_MAX_DECIMALS` | 4 | 常规价格小数位上限 |
-| `TTCOIN_SCALE_MIN_ZEROS` | 3 | 小数前导 0 达到几个才放大价格 |
+| `TTCOIN_MAX_DECIMALS_SMALL` | 7 | 小额价格（小数位前面都是 0）的小数位上限 |
 | `TTCOIN_API_URL` | Binance `ticker/24hr` | 换源需同步改 `ttcoin_fetch()` 解析字段 |
 
 ## 6. 发布后冒烟（4 条命令 + 1 张日志）
 
 ```bash
 # ① 基础连通 + 契约形状
-curl -s 'https://api.example.com/ttcoin/api/coin.php' | head -c 300
+curl -s 'https://your-domain.example/coin.php' | head -c 300
 # 期望：[{"symbol":"BTC","base":"BTC","price":"...","change":"..."}, ...]  全量
 
 # ② Widget 精简：只回 3 项
@@ -153,11 +153,11 @@ curl -sI '.../coin.php?uid=ac915d42' | grep -i x-ttcoin-uid
 curl -s -o /dev/null -w '%{time_starttransfer}\n' '.../coin.php'
 ```
 
-日志（`<数据目录>/logs/coin.log`）应出现 6 列、每行独立：
+日志（`<数据目录>/logs/coin.log`）应出现 7 列、每行独立：
 
 ```text
-2026-11-08 11:20:01	widget	ac915d42	203.0.113.7	hit	top3
-2026-11-08 11:20:11	app	ac915d42	203.0.113.7	async	age=37
+2026-11-10 11:20:01	widget	TCa1b2c3d4	ac915d42	203.0.113.7	hit	top3
+2026-11-10 11:20:11	app	99999999!	ac915d42	203.0.113.7	async	age=37
 ```
 
 验收标准：`hit` / `async` 占绝大多数；偶发 `fresh` 正常；持续 `stale` 说明上游不可达。
@@ -188,7 +188,7 @@ ttfb=22.09 total=22.09     # 背靠背第 2 次（紧接着第 1 次，理论上
 ```bash
 ls -l <数据目录>/cache/coin.json        # 存在吗？
 stat -c '%y %s' <数据目录>/cache/coin.json   # 每次请求后 mtime 是否前进
-tail -5 <数据目录>/logs/coin.log        # 第 5 列是否出现 hit / async
+tail -5 <数据目录>/logs/coin.log        # 第 6 列是否出现 hit / async
 ```
 
 - 文件不存在或 mtime 不动 → `ttcoin_cache_write()` 静默失败（目录不可写），此时所有请求都会阻塞拉上游，手表必然长时间停在 `- Cache -`；
@@ -218,7 +218,7 @@ tail -5 <数据目录>/logs/coin.log        # 第 5 列是否出现 hit / async
 | R3 | 数据目录落在 docroot 内 | 缓存 / 日志可被直接下载 | 文档给了 Nginx `deny` 与 `TTCOIN_DATA_DIR` 两种解法；上线后按 README「数据会不会被公网访问」实测两条 `curl -sI` |
 | R4 | 未跑 `php -l` | 语法错误会 500 | 第 4.1 节列为发布门禁 |
 | R5 | 只做 Unicorn 单进程锁 | 多机部署时各自刷各自的 | 当前单机部署，不涉及 |
-| R6 | **缓存可能没真正生效**（新发现） | 每个请求都阻塞拉上游 → 表端长时间 `- Cache -`，异步档形同虚设 | 11-08 实测：背靠背两次请求第二次仍 22s，不符合"命中 10s TTL"；按 §6.1 三行命令核对 `cache/coin.json` 的 mtime 与日志第 5 列 |
+| R6 | **缓存可能没真正生效**（新发现） | 每个请求都阻塞拉上游 → 表端长时间 `- Cache -`，异步档形同虚设 | 11-08 实测：背靠背两次请求第二次仍 22s，不符合"命中 10s TTL"；按 §6.1 三行命令核对 `cache/coin.json` 的 mtime 与日志第 6 列 |
 | R7 | 网络路径有本地代理接管 | ttfb 抖动 2.7~22s，误判为服务端慢 | 拆 `time_namelookup/connect/appconnect` 再下结论，见 §6.1 |
 | R8 | **上游域名个别不可达 / DNS 污染** | 单域名连不上 → 一直返回缓存，日志刷 `HTTP 0 … timed out` | 已缓解：`TTCOIN_API_FALLBACKS` 六域名轮询 + 记住上次成功域名；被污染时用 `TTCOIN_RESOLVE` 钉 IP，出口被封时用 `TTCOIN_PROXY`。诊断走 `php diag.php` |
 

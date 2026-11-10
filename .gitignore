@@ -1,15 +1,22 @@
-# ---- 运行时数据（缓存与日志绝不入库）----
+# ---- 本地配置（绝不提交）----
+# 从 config.example.php 复制而来，里面可能有你的域名、数据目录、
+# 诊断密钥（TTCOIN_DIAG_TOKEN）、代理地址（TTCOIN_PROXY）、固定 IP（TTCOIN_RESOLVE）
+config.php
+
+# ---- 运行时数据：缓存与请求日志 ----
 cache/*
 !cache/.htaccess
 logs/*
 !logs/.htaccess
+coin_cache.json
+coin.log
+coin.log.old
 *.log
 
-# ---- 本地个性化配置 ----
-# config.php 只有开关与目录、没有密钥，仓库里给的是默认值；
-# 如果你本地把数据目录挪到了 docroot 之外，注意别把私有路径推上来。
-# 想彻底避免冲突，可改为忽略它并使用 config.example.php
-# config.php
+# ---- Cloudflare Worker 本地开发 ----
+worker/.dev.vars
+worker/.wrangler/
+node_modules/
 
 # ---- 编辑器 / 系统 ----
 .idea/

@@ -70,7 +70,7 @@ define('TTCOIN_API_FALLBACKS', [
     'https://api4.binance.com/api/v3/ticker/24hr',
 ]);
 
-// 可选：HTTP 代理（如 'http://192.168.1.10:7890'）。留空 = 直连。
+// 可选：HTTP 代理（如 'http://proxy.example:7890'）。留空 = 直连。
 // 服务器到 Binance 全域名都不通时，这是唯一的解法（见 README 排查章节）。
 if (!defined('TTCOIN_PROXY')) {
     define('TTCOIN_PROXY', '');
@@ -101,16 +101,11 @@ define('TTCOIN_STALE_SERVE', 600);
 // 只有超过这个位数才四舍五入。
 define('TTCOIN_MAX_DECIMALS', 4);
 
-// 小额价格放大显示（见 ttcoin_scale_price()）：
-// 卫星币价格形如 0.00001826，按 4 位小数四舍五入后会变成 "0"，屏幕上就没信息了。
-// 规则：小数部分前导 0 达到 TTCOIN_SCALE_MIN_ZEROS 个时，把价格乘以 10^(n-1)，
-// 让第一个有效数字落到小数点后第 2 位（0.0xxx），并在币种名前加 "10^(n-1)*"。
-//   n=3 → ×100    → 100*SHIB
-//   n=4 → ×1000   → 1000*SHIB
-//   n=5 → ×10000  → 10000*SHIB
-// 放大后允许显示到 5 位小数（比常规多一位，不然等于白放大）。
-define('TTCOIN_SCALE_MIN_ZEROS', 3);
-define('TTCOIN_MAX_DECIMALS_SCALED', 5);
+// 小额价格（整数部分为 0、小数位前面都是 0，如 0.00001826）：
+// 按 4 位小数四舍五入会变成 "0"，屏幕上就没信息了，放宽到最多 7 位。
+// 不再做旧版的放大换算（1000*SHIB 这种倍数前缀已移除），
+// 币种名照常显示原始简称。
+define('TTCOIN_MAX_DECIMALS_SMALL', 7);
 
 // Widget 精简输出开关。
 //
@@ -143,6 +138,478 @@ if (!defined('TTCOIN_WIDGET_TOP_N')) {
     define('TTCOIN_WIDGET_TOP_N', 3);
 }
 
+// ---------------------------------------------------------------------------
+// 表盘（?type=face）专属显示配置
+// ---------------------------------------------------------------------------
+//
+// 只影响 type=face 的**出口**：缓存里始终存完整列表，app / widget 完全不受影响。
+// 这也是为什么开关随时能改，不会触发重新抓上游。
+//
+// 为什么「滚屏 / 固定」是用数组条数下发、而不是新加一个 JSON 字段：
+// TTCoin_Face 的后台服务只认 [{symbol, base, price, change}, ...] 这个数组
+// （source/TTCoinFaceService.mc），前台 TTCoinFaceView.mc 的 rotate() 逐条轮播。
+// 给它多条 = 滚屏；只给一条 = 轮播索引恒为 0，也就是固定显示。
+// 输出契约一个字都不用改，表盘端零改动就能切换。
+//
+// 覆盖方式（与 Widget 开关一致）：
+//   1. 站点目录 config.php 里 define(...)；
+//   2. 环境变量同名（TTCOIN_FACE_MODE 等）。
+// config.php 的常量优先；都没给就用下面的默认值。
+//
+//   TTCOIN_FACE_MODE    scroll（滚屏） / fixed（固定）。非法值一律回落 scroll，
+//                       避免一个拼写错误就让表盘拿到空数组。
+//   TTCOIN_FACE_ORDER   独立的币种轮播顺序，逗号分隔，按 base 匹配
+//                       （symbol 与 base 在当前版本内容相同；旧缓存里可能还有
+//                       "1000*SHIB" 这种带倍数前缀的 symbol）。没列进去的币
+//                       不会出现在 face 的响应里；默认把 DOGE 放第一，与表盘
+//                       版式示例一致。留空 = 回落到候选池顺序。
+//   TTCOIN_FACE_FIXED   fixed 模式固定显示哪个币；留空或写错 = 用 ORDER 第一项。
+//   TTCOIN_FACE_TOP_N   scroll 模式最多回几条，0 = 按 ORDER 全给。
+//   TTCOIN_FACE_COIN    全局「主币种」：默认一套也生效。三种出口都会用——
+//                       face fixed 模式把它当 fixed、scroll 模式把它排到最前；
+//                       app / widget 把它在返回列表里排到最前（其余顺序不动）。
+//                       支持逗号分隔的多币种优先级列表（如 "BTC,ETH"）：按给定
+//                       顺序排到最前，fixed 模式取列表第一个。
+//                       留空 = 不重排，走候选池默认顺序（默认币种）。
+//   TTCOIN_FACE_IDS     按 ID 覆盖的一套配置（JSON 对象，键是表盘端设置里填的
+//                       行情配置 ID，随请求 ?id= 上来——表盘 / App / Widget
+//                       三个客户端都带，同一个 id 三端看到同一套行情）。
+//                       键值对里登记哪个键就覆盖哪个键，没登记的键继承上面
+//                       的默认值；mode / order / fixed / topN / coin 五个键都可覆盖：
+//                         {"11111111":{"mode":"fixed","fixed":"DOGE"},
+//                          "22222222":{"mode":"scroll"},
+//                          "33333333":{"coin":"BTC"},
+//                          "44444444":{"coin":"BTC,ETH"}}
+//                       同一个 id 里 coin 比 fixed 优先（coin 是主币种，可写
+//                       多个，fixed 模式下把固定币换成列表第一个）。
+//                       没带 id、或 id 没登记 = 全部走默认一套（默认币种）。
+function ttcoin_face_define($name, $default)
+{
+    if (defined($name)) {
+        return;
+    }
+
+    $env = getenv($name);
+
+    define($name, $env === false ? $default : $env);
+}
+
+ttcoin_face_define('TTCOIN_FACE_MODE',   'scroll');
+ttcoin_face_define('TTCOIN_FACE_ORDER',  'DOGE,BTC,ETH,SHIB,SOL,BNB,XRP,ADA,LINK,LTC,AVAX');
+ttcoin_face_define('TTCOIN_FACE_FIXED',  '');
+ttcoin_face_define('TTCOIN_FACE_TOP_N',  0);
+ttcoin_face_define('TTCOIN_FACE_COIN',   '');
+ttcoin_face_define('TTCOIN_FACE_IDS',    '{}');
+
+// ---------------------------------------------------------------------------
+// 涨幅口径（change 字段）
+// ---------------------------------------------------------------------------
+//   24h  （默认）上游给的滚动 24 小时涨跌幅，零改动、零额外请求。
+//   tz    指定时区的「自然日涨幅」：以该时区当日 00:00 的开盘价为基准，
+//         (现价 - 开盘价) / 开盘价 × 100。跨过当地 00:00 自动归零重算。
+//         日开盘价按「时区 + 当地日期」缓存，一天最多抓一次；抓不到就
+//         该币退回 24h，绝不让接口失败。
+//
+// TTCOIN_CHANGE_TZ 是**固定的 UTC 偏移**（不做夏令时换算），东八区写 8：
+//   8 / +8 / UTC+8 → 东八区   0 / Z → UTC   -5 → 美东标准时   5:30 / 5.5 → 印度
+// Binance klines 的 timeZone 参数支持整点和 H:MM，不支持小数，这里统一转换。
+// ---------------------------------------------------------------------------
+ttcoin_face_define('TTCOIN_CHANGE_MODE', '24h');
+ttcoin_face_define('TTCOIN_CHANGE_TZ',   '8');
+
+/**
+ * 解析固定 UTC 偏移。接受 8 / +8 / -5 / UTC+8 / 5:30 / 5.5 / Z（=0）。
+ *
+ * @return array{offset:int,param:string,label:string}|null 写错返回 null
+ */
+function ttcoin_tz_parse($raw)
+{
+    $text = strtoupper(trim((string) $raw));
+    $text = preg_replace('/^(UTC|GMT)\s*/', '', $text);
+    $text = str_replace(' ', '', $text);
+
+    if ($text === '' || $text === 'Z') {
+        $text = '0';
+    }
+
+    // 两种写法：H:MM 是「时:分」，H.M 是「小时的小数」（5.5 = 5:30）。
+    $sign = 1;
+    $mins = 0;
+
+    if (strpos($text, '.') !== false) {
+        if (!preg_match('/^([+-]?)(\d{1,2})\.(\d{1,2})$/', $text, $m)) {
+            return null;
+        }
+
+        $hours = (int) $m[2];
+        $mins  = (int) round((float) ('0.' . $m[3]) * 60);
+        $sign  = ($m[1] === '-') ? -1 : 1;
+    } else {
+        if (!preg_match('/^([+-]?)(\d{1,2})(?::(\d{1,2}))?$/', $text, $m)) {
+            return null;
+        }
+
+        $hours = (int) $m[2];
+        $mins  = (isset($m[3]) && $m[3] !== '') ? (int) $m[3] : 0;
+        $sign  = ($m[1] === '-') ? -1 : 1;
+    }
+
+    // 分只允许 0…59；小数小时写法算出来最多 59 分（0.99h → 59 分）
+    if ($mins > 59 || $hours > 14) {
+        return null;
+    }
+
+    $offset = $sign * ($hours * 3600 + $mins * 60);
+
+    // Binance klines timeZone 只认 ^[-+]?[0-9]{1,2}(:[0-9]{1,2})?$
+    $param = ($mins === 0)
+        ? (string) ($sign * $hours)
+        : (($sign < 0 ? '-' : '') . $hours . ':' . str_pad((string) $mins, 2, '0', STR_PAD_LEFT));
+
+    $label = ($offset === 0)
+        ? 'UTC'
+        : 'UTC' . ($sign > 0 ? '+' : '-') . $hours . ($mins === 0 ? '' : ':' . str_pad((string) $mins, 2, '0', STR_PAD_LEFT));
+
+    return ['offset' => $offset, 'param' => $param, 'label' => $label];
+}
+
+/** 本次进程生效的涨幅配置（常量在 require 时固化，环境变量也能覆盖）。 */
+function ttcoin_change_config()
+{
+    $mode = strtolower(trim((string) TTCOIN_CHANGE_MODE));
+    $mode = ($mode === 'tz' || $mode === 'timezone' || $mode === 'day') ? 'tz' : '24h';
+
+    $tz = ttcoin_tz_parse(TTCOIN_CHANGE_TZ);
+
+    if ($tz === null) {
+        $tz = ttcoin_tz_parse('8');       // 写错时区不猜：明确回落到东八区
+    }
+
+    return [
+        'mode' => $mode,
+        'tz'   => $tz,
+        'day'  => gmdate('Y-m-d', time() + $tz['offset']),
+    ];
+}
+
+/** 涨幅百分比 → 与 24h 同款的可显示文本：最多 3 位小数、去尾零、-0 归 0。 */
+function ttcoin_change_text($pct)
+{
+    if (!is_float($pct) && !is_int($pct)) {
+        return null;
+    }
+
+    if (!is_finite((float) $pct)) {
+        return null;
+    }
+
+    $text = rtrim(rtrim(number_format((float) $pct, 3, '.', ''), '0'), '.');
+
+    if ($text === '' || $text === '-' || $text === '-0') {
+        $text = '0';
+    }
+
+    return $text;
+}
+
+/** 自然日涨幅 = (现价 - 当地 00:00 开盘价) / 开盘价 × 100。 */
+function ttcoin_day_change($last, $open)
+{
+    $l = (float) $last;
+    $o = (float) $open;
+
+    if (!is_finite($l) || !is_finite($o) || $o <= 0 || $l <= 0) {
+        return null;
+    }
+
+    return ttcoin_change_text(($l - $o) / $o * 100);
+}
+
+/**
+ * 请求里的行情配置 ID（可选参数 ?id=）。
+ *
+ * 表盘端手机设置里填的 faceId 随请求带上来；只留字母数字、限长 32，
+ * 没带 / 全是非法字符 = ''（走默认配置）。
+ */
+function ttcoin_face_client_id()
+{
+    static $id = null;
+
+    if ($id !== null) {
+        return $id;
+    }
+
+    $raw = isset($_GET['id']) && is_string($_GET['id']) ? $_GET['id'] : '';
+
+    $id = (string) preg_replace('/[^A-Za-z0-9]/', '', trim($raw));
+
+    if (strlen($id) > 32) {
+        $id = substr($id, 0, 32);
+    }
+
+    return $id;
+}
+
+/**
+ * 这个 id 在 TTCOIN_FACE_IDS 里登记过没有。
+ *
+ * 只给日志用（不参与任何出口计算）：客户端把 id 带上来、服务端却没登记时，
+ * 配置其实走的是默认一套 —— 这是「我填了 id 怎么没生效」最常见的原因。
+ * 日志里给这种 id 加一个 `!` 后缀（见 ttcoin_log_request()），
+ * 一眼就能分出「带了但没登记」和「登记过」。
+ */
+function ttcoin_face_id_known($id)
+{
+    $id = (string) $id;
+
+    if ($id === '') {
+        return false;
+    }
+
+    $ids = json_decode((string) TTCOIN_FACE_IDS, true);
+
+    return is_array($ids) && isset($ids[$id]);
+}
+
+/**
+ * 把配置清洗成运行时用的结构，按 id 分别算一次。
+ *
+ * 先算默认一套（TTCOIN_FACE_*），再如果请求带了 id 且 TTCOIN_FACE_IDS
+ * 里登记了它，就按登记的键逐个覆盖（键值里写哪个键覆盖哪个键），
+ * 最后统一清洗。所以不管默认还是按 id，清洗规则完全一致。
+ *
+ * @param string|null $id 行情配置 ID；null = 从 ?id= 里取
+ * @return array{mode:string,order:array,fixed:string,topN:int,coin:string,id:string}
+ */
+function ttcoin_face_config($id = null)
+{
+    if ($id === null) {
+        $id = ttcoin_face_client_id();
+    }
+
+    $id = (string) preg_replace('/[^A-Za-z0-9]/', '', (string) $id);
+
+    if (strlen($id) > 32) {
+        $id = substr($id, 0, 32);
+    }
+
+    static $cache = [];
+
+    if (isset($cache[$id])) {
+        return $cache[$id];
+    }
+
+    // —— 默认一套的原始值 ——
+    $raw = [
+        'mode'  => strtolower(trim((string) TTCOIN_FACE_MODE)),
+        'order' => TTCOIN_FACE_ORDER,
+        'fixed' => strtoupper(trim((string) TTCOIN_FACE_FIXED)),
+        'topN'  => (int) TTCOIN_FACE_TOP_N,
+        'coin'  => strtoupper(trim((string) TTCOIN_FACE_COIN)),
+    ];
+
+    // —— 按 id 覆盖：登记了哪个键就覆盖哪个键 ——
+    if ($id !== '') {
+        $ids = json_decode((string) TTCOIN_FACE_IDS, true);
+
+        if (is_array($ids) && isset($ids[$id]) && is_array($ids[$id])) {
+            $over = $ids[$id];
+
+            if (array_key_exists('mode', $over)) {
+                $raw['mode'] = strtolower(trim((string) $over['mode']));
+            }
+
+            if (array_key_exists('order', $over)) {
+                $raw['order'] = $over['order'];
+            }
+
+            if (array_key_exists('fixed', $over)) {
+                $raw['fixed'] = strtoupper(trim((string) $over['fixed']));
+            }
+
+            if (array_key_exists('topN', $over)) {
+                $n = (int) $over['topN'];
+                $raw['topN'] = $n >= 0 ? $n : 0;
+            }
+
+            if (array_key_exists('coin', $over)) {
+                $raw['coin'] = strtoupper(trim((string) $over['coin']));
+            }
+        }
+    }
+
+    // —— 统一清洗（默认与按 id 走同一套规则）——
+    $mode = $raw['mode'] === 'fixed' ? 'fixed' : 'scroll';
+
+    $list = is_array($raw['order']) ? $raw['order'] : explode(',', (string) $raw['order']);
+
+    $order = [];
+
+    foreach ($list as $base) {
+        if (!is_string($base)) {
+            continue;
+        }
+
+        $base = strtoupper(trim($base));
+        $base = (string) preg_replace('/[^A-Z0-9]/', '', $base);
+
+        if ($base !== '' && !in_array($base, $order, true)) {
+            $order[] = $base;
+        }
+    }
+
+    if (empty($order)) {
+        $order = array_map('strtoupper', array_values(ttcoin_symbols()));
+    }
+
+    $fixed = (string) preg_replace('/[^A-Z0-9]/', '', $raw['fixed']);
+
+    if ($fixed === '' || !in_array($fixed, $order, true)) {
+        $fixed = $order[0];
+    }
+
+    $topN = $raw['topN'] >= 0 ? $raw['topN'] : 0;
+
+    // —— 主币种（coin）：比 fixed 优先 ——
+    // 支持逗号分隔的多币种优先级列表（如 "BTC,ETH"）：去重后按给定顺序
+    // 排到 order 最前（order 里没有的币也会补进来，与单币种行为一致），
+    // 列表外的币保持原相对顺序；fixed 模式下固定币换成列表第一个——
+    // fixed 只回一条，多币种对它无意义，取第一个即可。
+    $coinList = ttcoin_coin_list($raw['coin']);
+
+    // 倒序逐个提到最前：正序遍历会把 "BTC,ETH" 摆成 ETH 在前
+    for ($i = count($coinList) - 1; $i >= 0; $i--) {
+        $base = $coinList[$i];
+        $pos = array_search($base, $order, true);
+
+        if ($pos !== false && $pos !== 0) {
+            unset($order[$pos]);
+            $order = array_values($order);
+        }
+
+        if ($order[0] !== $base) {
+            array_unshift($order, $base);
+        }
+    }
+
+    $coin = implode(',', $coinList);            // "BTC,ETH"；单币种时就是 "BTC"
+
+    if (!empty($coinList) && $mode === 'fixed') {
+        $fixed = $coinList[0];
+    }
+
+    $config = [
+        'mode'  => $mode,
+        'order' => $order,
+        'fixed' => $fixed,
+        'topN'  => $topN,
+        'coin'  => $coin,
+        'id'    => $id,
+    ];
+
+    $cache[$id] = $config;
+
+    return $config;
+}
+
+/**
+ * 取一条行情的 base（用于跟 FACE_ORDER 匹配）。
+ *
+ * 当前版本 symbol 与 base 相同（不再加倍数前缀）。历史缓存可能没有 base
+ * 字段，这时退回 symbol；更早版本的缓存里 symbol 可能是 "1000*SHIB"
+ * 这种带倍数前缀的写法，取星号后面那段兜底。
+ */
+function ttcoin_face_base($item)
+{
+    if (!is_array($item)) {
+        return '';
+    }
+
+    $base = isset($item['base']) && is_string($item['base']) ? $item['base'] : '';
+
+    if ($base === '' && isset($item['symbol']) && is_string($item['symbol'])) {
+        $parts = explode('*', $item['symbol']);
+        $base  = $parts[count($parts) - 1];
+    }
+
+    return strtoupper((string) preg_replace('/[^A-Za-z0-9]/', '', (string) $base));
+}
+
+/**
+ * 按 face 配置重排 / 裁剪完整列表。
+ *
+ * 顺序只认 FACE_ORDER 里列出的币，没列到的不返回 —— 这就是「独立排序」：
+ * 想让表盘先看 DOGE 再看 BTC，改配置即可，不用动候选池顺序（那个是 App 用的）。
+ */
+function ttcoin_face_output($data, $config)
+{
+    $byBase = [];
+
+    foreach ($data as $item) {
+        $base = ttcoin_face_base($item);
+
+        if ($base !== '' && !isset($byBase[$base])) {
+            $byBase[$base] = $item;
+        }
+    }
+
+    $ordered = [];
+
+    foreach ($config['order'] as $base) {
+        if (isset($byBase[$base])) {
+            $ordered[] = $byBase[$base];
+        }
+    }
+
+    if (empty($ordered)) {
+        // 配置里的币一个都没拿到（上游缺币 / 配置写错 / 历史脏缓存）：
+        // 宁可退回完整列表，也不能让表盘收到空数组（它会显示 "--"）。
+        $ordered = $data;
+    }
+
+    if ($config['mode'] === 'fixed') {
+        $picked = isset($byBase[$config['fixed']])
+            ? $byBase[$config['fixed']]
+            : $ordered[0];
+
+        return [$picked];
+    }
+
+    if ($config['topN'] > 0) {
+        $ordered = array_slice($ordered, 0, $config['topN']);
+    }
+
+    return $ordered;
+}
+
+/**
+ * 请求日志第 6 列的备注：一眼看出这次 face 请求用了什么模式、哪几个币。
+ * 带配置 ID 时写成 face#ID:mode:…，方便区分默认一套和按 id 的覆盖。
+ */
+function ttcoin_face_note($type)
+{
+    if ($type !== 'face') {
+        return '';
+    }
+
+    $config = ttcoin_face_config();
+
+    if ($config['mode'] === 'fixed') {
+        $shown = [$config['fixed']];
+    } else {
+        $limit = $config['topN'] > 0 ? $config['topN'] : 3;
+        $shown = array_slice($config['order'], 0, $limit);
+    }
+
+    $prefix = 'face';
+
+    if ($config['id'] !== '') {
+        $prefix .= '#' . $config['id'];
+    }
+
+    return $prefix . ':' . $config['mode'] . ':' . implode(',', $shown);
+}
+
 /**
  * 客户端唯一标识（可选参数 ?uid=）。
  *
@@ -164,14 +631,17 @@ function ttcoin_client_uid()
  * 客户端形态标记（可选参数 ?type=）。
  *
  * 手表端固定携带：Watch App 版发 "app"，Widget 版发 "widget"，
- * 用来在日志里区分同一块表上的两种安装形态。
- * 白名单只认这两个值，其他一律按空串处理（日志里显示 "-"）。
+ * TTCoin_Face（表盘版）发 "face"，用来在日志里区分同一块表上的几种安装形态。
+ * 白名单只认这三个值，其他一律按空串处理（日志里显示 "-"）。
+ *
+ * face 不只是个日志标签：它会走一套独立的出口配置（滚屏 / 固定 + 币种排序），
+ * 见下面 ttcoin_face_config() 与 ttcoin_filter_output()。
  */
 function ttcoin_client_type()
 {
     $raw = isset($_GET['type']) && is_string($_GET['type']) ? $_GET['type'] : '';
 
-    return in_array($raw, ['app', 'widget'], true) ? $raw : '';
+    return in_array($raw, ['app', 'widget', 'face'], true) ? $raw : '';
 }
 
 
@@ -283,23 +753,33 @@ function ttcoin_log_file()
  * 按设备记一行请求日志。
  *
  * 每次手表请求 coin.php 都在这里落一行（含命中缓存的请求），格式为
- * 制表符分隔的 6 列，方便 grep / awk / 导表格：
+ * 制表符分隔的 7 列，方便 grep / awk / 导表格：
  *
- *     2026-11-08 07:05:49  app  ac915d42...  203.0.113.7  hit
- *     └─ 时间              └─形态 └─ uid(-空)  └─ 客户端 IP  └─事件
+ *     2026-11-10 11:20:03  face  11111111  ac915d42...  203.0.113.7  hit   face#11111111:fixed:DOGE
+ *     └─ 时间              └─形态 └─ id     └─ uid        └─ 客户端 IP  └─事件 └─备注
  *
- * type 取值：app / widget，客户端未携带或非法时为 "-"。
+ * type 取值：app / widget / face，客户端未携带或非法时为 "-"。
+ * id 是客户端 ?id= 带来的行情配置 ID（自动生成或手填），没带时为 "-"；
+ * 带了但 TTCOIN_FACE_IDS 里没登记，会写成 `xxxx!`（感叹号 = 没登记，
+ * 实际走的是默认一套配置）。
  * event 取值：
  *   hit     命中新缓存直接返回（上游零调用）
  *   fresh   缓存过期，重新拉上游成功
  *   stale   上游拉取失败，返回了旧缓存
  *   error   上游失败且无旧缓存（502）或编码失败（500）
  *
- * 隐私说明：uid 是应用级匿名设备标识（关联不到 Garmin 账号），
- * IP 仅用于排障，日志文件不对公网开放（.htaccess / 部署目录约定）。
+ * 隐私说明：id 由客户端本地生成（`TC` + 设备 uniqueIdentifier，或手填），
+ * uid 是应用级匿名设备标识（关联不到 Garmin 账号），IP 仅用于排障，
+ * 日志文件不对公网开放（.htaccess / 部署目录约定）。
  * 单文件超过 2MB 自动滚动为 coin.log.old，防止无限增长。
+ *
+ * @param string      $type   客户端形态（app / widget / face，'' = 未知）
+ * @param string      $uid    设备匿名标识（见 ttcoin_client_uid()）
+ * @param string      $event  hit / async / fresh / stale / error
+ * @param string      $detail 备注（失败原因 / age=N / top3 / face:...）
+ * @param string|null $id     行情配置 ID；null = 自己从 ?id= 取
  */
-function ttcoin_log_request($type, $uid, $event, $detail = '')
+function ttcoin_log_request($type, $uid, $event, $detail = '', $id = null)
 {
     $file = ttcoin_log_file();
 
@@ -314,10 +794,22 @@ function ttcoin_log_request($type, $uid, $event, $detail = '')
     // detail 可能来自上游报错文本，先压掉其中的换行/制表符，避免一条拆成多行或多列
     $detail = str_replace(["\r\n", "\r", "\n", "\t"], ' ', (string) $detail);
 
+    if ($id === null) {
+        $id = ttcoin_face_client_id();
+    }
+
+    // id 列：没带 -> "-"；带了没登记 -> 末尾加 "!"（配置走的是默认一套）
+    if ($id === '') {
+        $idCol = '-';
+    } else {
+        $idCol = ttcoin_face_id_known($id) ? $id : $id . '!';
+    }
+
     $line = sprintf(
-        "%s\t%s\t%s\t%s\t%s\t%s\n",
+        "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
         date('Y-m-d H:i:s'),
         $type === '' ? '-' : $type,
+        $idCol,
         $uid === '' ? '-' : $uid,
         isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '-',
         $event,
@@ -478,21 +970,138 @@ function ttcoin_encode($data)
 }
 
 /**
- * 按客户端形态裁剪输出。
+ * 把 coin 配置清洗成去重后的币种数组。
  *
- * 缓存文件里**永远存完整列表**，App 与 Widget 共用同一份；只在返回前按需截断。
+ * coin 支持逗号分隔的多币种优先级列表（如 "BTC,ETH"），也兼容单个币种
+ * （"BTC"）。每段清洗成大写字母数字、去空段、按出现顺序去重。
+ *
+ * @param  string $coin 配置里的 coin 原始值（可能含逗号）
+ * @return string[] 清洗后的币种数组；全是非法字符时为空数组
+ */
+function ttcoin_coin_list($coin)
+{
+    $list = [];
+
+    foreach (explode(',', strtoupper((string) $coin)) as $part) {
+        $base = (string) preg_replace('/[^A-Z0-9]/', '', $part);
+
+        if ($base !== '' && !in_array($base, $list, true)) {
+            $list[] = $base;
+        }
+    }
+
+    return $list;
+}
+
+/**
+ * 把主币种排到完整列表最前（其余币的相对顺序不动）。
+ *
+ * 只在配置里 coin 非空时调用：app / widget 不做 face 那套重排裁剪，但
+ * 「这个 id 想先看到某个币」的诉求是共通的——列表第一个就是主币种。
+ * coin 支持逗号分隔的多币种列表（"BTC,ETH"）：去重后按给定顺序把列表里
+ * 的币提到最前（一条行情只被挑一次），列表外的币保持原相对顺序。
+ * 列表里的币一条都没匹配上（上游缺币 / 配置写错）时原样返回，绝不动列表。
+ *
+ * @param array  $data 完整行情列表
+ * @param string $coin 主币种，或逗号分隔的优先级列表（已清洗成大写字母数字）
+ * @return array 重排后的列表；没匹配上就是原列表
+ */
+function ttcoin_coin_first($data, $coin)
+{
+    $coins = ttcoin_coin_list($coin);
+
+    if (empty($coins) || !is_array($data)) {
+        return $data;
+    }
+
+    $used = [];
+    $picked = [];
+
+    foreach ($coins as $want) {
+        foreach ($data as $i => $item) {
+            if (isset($used[$i])) {
+                continue;
+            }
+
+            if (ttcoin_face_base($item) === $want) {
+                $picked[] = $item;
+                $used[$i] = true;
+                break;
+            }
+        }
+    }
+
+    if (empty($picked)) {
+        return $data;                           // 列表里的币一个都没匹配上
+    }
+
+    foreach ($data as $i => $item) {
+        if (!isset($used[$i])) {
+            $picked[] = $item;
+        }
+    }
+
+    return $picked;
+}
+
+/**
+ * 按客户端形态裁剪 / 重排输出。
+ *
+ * 缓存文件里**永远存完整列表**，app / widget / face 共用同一份；只在返回前按需处理。
  * 这样做的三个好处：
  *   1. 开关随时开关，缓存不用作废、不会触发一次多余的上游抓取；
- *   2. App 与 Widget 交替请求时，先来的那个不会把缓存"写窄"；
+ *   2. 三种形态交替请求时，先来的那个不会把缓存"写窄"；
  *   3. cron 预热（update_price.php）写进去的始终是完整数据。
+ *
+ * 四种出口：
+ *   face    → ttcoin_face_output()：按独立顺序重排；fixed 只回一条，scroll 回前 N 条
+ *   widget  → 主币种排前（coin 配了才动）→ 候选池顺序的前 TTCOIN_WIDGET_TOP_N 项
+ *   app     → 主币种排前（coin 配了才动），其余原样
+ *   其他    → 原样（不带 type）
  *
  * @param string $json 完整列表的 JSON 字符串
  * @param string $type 客户端形态（ttcoin_client_type() 的返回值）
- * @return string 裁剪后的 JSON；未开启、非 widget、条数不足、解析失败时原样返回
+ * @return string 处理后的 JSON；解析失败 / 无数据时原样返回
  */
 function ttcoin_filter_output($json, $type)
 {
-    if (!TTCOIN_WIDGET_LIMIT || $type !== 'widget' || !is_string($json)) {
+    if (!is_string($json) || $json === '' || $type === '') {
+        return $json;
+    }
+
+    if ($type === 'face') {
+        $data = json_decode($json, true);
+
+        if (!is_array($data) || empty($data)) {
+            return $json;
+        }
+
+        $shaped = ttcoin_encode(ttcoin_face_output($data, ttcoin_face_config()));
+
+        return $shaped === null ? $json : $shaped;
+    }
+
+    // app / widget：登记的 id 配了 coin 时，把主币种排到最前。
+    // 没配 coin（默认）这里一个字节都不动，返回的还是原始 JSON。
+    $config = ttcoin_face_config();
+
+    if ($config['coin'] !== '') {
+        $data = json_decode($json, true);
+
+        if (is_array($data) && !empty($data)) {
+            $moved = ttcoin_coin_first($data, $config['coin']);
+
+            if ($moved !== $data) {
+                $shaped = ttcoin_encode($moved);
+
+                if ($shaped !== null) {
+                    $json = $shaped;
+                }
+            }
+        }
+    }
+
+    if (!TTCOIN_WIDGET_LIMIT || $type !== 'widget') {
         return $json;
     }
 
@@ -514,9 +1123,13 @@ function ttcoin_filter_output($json, $type)
  * 规则：上游给几位小数就保留几位，只有超过 TTCOIN_MAX_DECIMALS 位才
  * 四舍五入（去掉尾部多余的 0，整数不留小数点）。
  *
+ * 例外：小额价格——整数部分为 0 且小数位前面都是 0（如 0.00001826）——
+ * 按 4 位四舍五入会变成 "0"，这类值放宽到最多 TTCOIN_MAX_DECIMALS_SMALL 位。
+ *
  *     75701.02000000 → 75701.02
  *     2235.51000000  → 2235.51
- *     0.07161000     → 0.0716      5 位，四舍五入到 4 位
+ *     0.07161000     → 0.07161     小额价格，最多 7 位
+ *     0.00001826000  → 0.0000183   小额价格，最多 7 位（第 8 位 6 → 进位）
  *     67000.00000000 → 67000
  *
  * 为什么不在手表端格式化：
@@ -540,6 +1153,12 @@ function ttcoin_format_price($raw, $maxDecimals = TTCOIN_MAX_DECIMALS)
 
     if ($text === '') {
         return null;
+    }
+
+    // 小额价格：整数部分为 0、小数位前面都是 0（0.00001826）时放宽位数，
+    // 否则按常规位数四舍五入会直接变成 "0"。两种写法分支共用同一条规则。
+    if (preg_match('/^-?0\.0\d/', $text) === 1) {
+        $maxDecimals = TTCOIN_MAX_DECIMALS_SMALL;
     }
 
     // 常规十进制字面量：按字符串逐位处理，不经过 float
@@ -612,67 +1231,6 @@ function ttcoin_format_price($raw, $maxDecimals = TTCOIN_MAX_DECIMALS)
     $fixed = rtrim(rtrim($fixed, '0'), '.');
 
     return $fixed === '' || $fixed === '-' ? null : $fixed;
-}
-
-/**
- * 小额价格放大：把 0.00001826 这类"小数点后一长串 0"的报价换算成 0.0xxx 显示。
- *
- * 阈值与倍数都由小数部分的**前导 0 个数 n** 决定：
- *
- *     n=3  0.000123    ×100     → 0.0123    显示 100*XXX
- *     n=4  0.00001826  ×1000    → 0.01826   显示 1000*XXX
- *     n=5  0.00000715  ×10000   → 0.0715    显示 10000*XXX
- *     n=6  0.00000012  ×100000  → 0.012     显示 100000*XXX
- *
- * 也就是"乘到第一个有效数字落在小数点后第 2 位"（0.0xxx 这个量级），
- * 读起来的量级和 0.07 / 0.18 这些常规币种一致，也不会再出现 0.0000
- * 被四舍五入成 "0" 的情况。
- *
- * 不放大：整数部分非 0；负数 / 科学计数法 / 脏数据（交给普通格式化）；
- * 前导 0 少于 3 个（0.07、0.001 本来就看得清）；去掉尾部 0 后本来就在
- * 4 位小数以内（如 0.0001，原样显示就行）。
- *
- * @param mixed $raw 上游给的 lastPrice
- * @return array{price:string|null, factor:int} factor=1 表示没放大
- */
-function ttcoin_scale_price($raw)
-{
-    $plain = ['price' => ttcoin_format_price($raw), 'factor' => 1];
-
-    if (!is_string($raw)) {
-        return $plain;                       // 数字型上游：不做字符串移位
-    }
-
-    $text = trim($raw);
-
-    if (preg_match('/^(\d+)\.(\d+)$/', $text, $m) !== 1) {
-        return $plain;                       // 负号 / 科学计数法 / 非数字
-    }
-
-    if (ltrim($m[1], '0') !== '') {
-        return $plain;                       // 整数部分非 0：正常价格
-    }
-
-    $frac = rtrim($m[2], '0');
-
-    if ($frac === '' || strlen($frac) <= TTCOIN_MAX_DECIMALS) {
-        return $plain;                       // 价格为 0，或本就显示得下（0.0001）
-    }
-
-    $zeros = strspn($frac, '0');
-
-    if ($zeros < TTCOIN_SCALE_MIN_ZEROS) {
-        return $plain;                       // 0.07 / 0.001 这类不需要放大
-    }
-
-    // 直接移位小数串，不经过 float：0.00001826 → "0.0" + "1826"
-    $price = ttcoin_format_price('0.0' . substr($frac, $zeros), TTCOIN_MAX_DECIMALS_SCALED);
-
-    if ($price === null || $price === '0') {
-        return $plain;                       // 兜底：放大后反而没东西可显示
-    }
-
-    return ['price' => $price, 'factor' => (int)pow(10, $zeros - 1)];
 }
 
 /**
@@ -813,14 +1371,265 @@ function ttcoin_http_get($url, $connectTimeout, $timeout)
 }
 
 /**
+ * 把 ticker/24hr 的候选域名换成 klines 端点。二者是同一批 Binance 公开域名，
+ * 连通性一致；记住的优先域名（upstream.txt）也照样复用。
+ */
+function ttcoin_kline_bases()
+{
+    $out = [];
+
+    foreach (ttcoin_upstream_candidates() as $url) {
+        $base = preg_replace('#/api/v3/ticker/24hr$#', '/api/v3/klines', $url);
+
+        if ($base !== null && $base !== $url && strpos($base, 'https://') === 0) {
+            $out[] = $base;
+        }
+    }
+
+    return array_values(array_unique($out));
+}
+
+/**
+ * 并行 GET 一批 URL，返回 [键 => 响应体|null]。
+ * 日开盘价要按币种各打一次 klines，串行 11 次会把刷新拖到十几秒，
+ * 所以走 curl_multi 一次发出去；单个失败只影响那一个币。
+ */
+function ttcoin_http_get_multi($urls, $connectTimeout, $timeout)
+{
+    $out = array_fill_keys(array_keys($urls), null);
+
+    if (!function_exists('curl_multi_init')) {
+        return $out;
+    }
+
+    $mh = curl_multi_init();
+    $handles = [];
+
+    $resolve = ttcoin_resolve_list();
+
+    foreach ($urls as $key => $url) {
+        $ch = curl_init();
+
+        $opts = [
+            CURLOPT_URL            => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => max(1, (int) ceil($timeout)),
+            CURLOPT_CONNECTTIMEOUT => max(1, (int) ceil($connectTimeout)),
+            CURLOPT_HTTPHEADER     => [
+                'Accept: application/json',
+                'User-Agent: ' . TTCOIN_USER_AGENT
+            ],
+        ];
+
+        if (defined('TTCOIN_PROXY') && TTCOIN_PROXY !== '') {
+            $opts[CURLOPT_PROXY] = TTCOIN_PROXY;
+        }
+
+        if ($resolve) {
+            $opts[CURLOPT_RESOLVE] = $resolve;
+        }
+
+        curl_setopt_array($ch, $opts);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$key] = $ch;
+    }
+
+    $deadline = microtime(true) + $timeout;
+
+    do {
+        $status = curl_multi_exec($mh, $active);
+
+        if ($active) {
+            curl_multi_select($mh, 0.1);
+        }
+    } while ($active && $status === CURLM_OK && microtime(true) < $deadline);
+
+    foreach ($handles as $key => $ch) {
+        $body = curl_multi_getcontent($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($code === 200 && is_string($body) && $body !== '') {
+            $out[$key] = $body;
+        }
+
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+    }
+
+    curl_multi_close($mh);
+
+    return $out;
+}
+
+/**
+ * 抓一批币在「指定时区当日 00:00」的开盘价。
+ *
+ * Binance 的 /api/v3/klines 支持 timeZone 参数：interval=1d + limit=1 返回的
+ * 就是**当地当日这根（未走完的）日 K**，它的 [1] 开盘价即 00:00 价，
+ * 一整天不变。失败 / 无该币时跳过，由调用方退回 24h。
+ */
+function ttcoin_fetch_day_opens($symbols, $cfg, $budget)
+{
+    $found  = [];
+    $bases  = ttcoin_kline_bases();
+    $deadline = microtime(true) + max(1, (float) $budget);
+
+    foreach ($bases as $base) {
+        $missing = array_values(array_diff($symbols, array_keys($found)));
+
+        if (empty($missing)) {
+            break;
+        }
+
+        $left = $deadline - microtime(true);
+
+        if ($left < 0.5) {
+            break;
+        }
+
+        $urls = [];
+
+        foreach ($missing as $symbol) {
+            $urls[$symbol] = $base . '?' . http_build_query([
+                'symbol'   => $symbol,
+                'interval' => '1d',
+                'timeZone' => $cfg['tz']['param'],
+                'limit'    => 1,
+            ]);
+        }
+
+        $responses = ttcoin_http_get_multi($urls, 2, min(3, $left));
+
+        foreach ($responses as $symbol => $body) {
+            if (!is_string($body)) {
+                continue;
+            }
+
+            $klines = json_decode($body, true);
+
+            if (is_array($klines) && isset($klines[0][1])
+                && is_numeric($klines[0][1]) && (float) $klines[0][1] > 0) {
+                $found[$symbol] = (string) $klines[0][1];
+            }
+        }
+    }
+
+    return $found;
+}
+
+/**
+ * 带「按当地日期缓存」的日开盘价表。
+ *
+ * cache/dayopen.json = {day, tz, opens:{SYMBOL:价格}, missed:{SYMBOL:上次失败时间}}。
+ * 跨过当地 00:00 后 day 不匹配，整份作废重抓；抓不到的币记 missed，
+ * 5 分钟内不重试，避免某个币上游缺数据时每 10 秒都白打一次。
+ * 单文件 + flock 单飞，接口热路径上最多一次 file_get_contents。
+ */
+function ttcoin_day_opens($symbols, $cfg, $budget = 4)
+{
+    $file = ttcoin_storage_path('cache', 'dayopen.json', 'coin_dayopen.json');
+
+    $readState = function () use ($file, $cfg) {
+        $raw = @file_get_contents($file);
+        $state = is_string($raw) ? json_decode($raw, true) : null;
+
+        if (!is_array($state) || ($state['day'] ?? '') !== $cfg['day']
+            || ($state['tz'] ?? '') !== $cfg['tz']['param']) {
+            return [
+                'day'    => $cfg['day'],
+                'tz'     => $cfg['tz']['param'],
+                'opens'  => [],
+                'missed' => [],
+            ];
+        }
+
+        $state['opens']  = is_array($state['opens'] ?? null) ? $state['opens'] : [];
+        $state['missed'] = is_array($state['missed'] ?? null) ? $state['missed'] : [];
+
+        return $state;
+    };
+
+    $state = $readState();
+    $opens = $state['opens'];
+
+    $need = [];
+
+    foreach ($symbols as $symbol) {
+        if (isset($opens[$symbol])) {
+            continue;
+        }
+
+        $last = (int) ($state['missed'][$symbol] ?? 0);
+
+        if ($last > 0 && time() - $last < 300) {
+            continue;
+        }
+
+        $need[] = $symbol;
+    }
+
+    if (empty($need)) {
+        return $opens;
+    }
+
+    $lock = @fopen($file . '.lock', 'c');
+
+    if ($lock === false || !@flock($lock, LOCK_EX | LOCK_NB)) {
+        if ($lock !== false) {
+            @fclose($lock);
+        }
+
+        return $opens;                      // 另有进程在抓，这次先用已有值
+    }
+
+    $state = $readState();                  // 拿到锁后重读，别覆盖别的进程刚写的
+    $opens = $state['opens'];
+    $need  = [];
+
+    foreach ($symbols as $symbol) {
+        if (!isset($opens[$symbol]) && ((int) ($state['missed'][$symbol] ?? 0) === 0
+            || time() - (int) $state['missed'][$symbol] >= 300)) {
+            $need[] = $symbol;
+        }
+    }
+
+    if (!empty($need)) {
+        $found = ttcoin_fetch_day_opens($need, $cfg, $budget);
+
+        foreach ($need as $symbol) {
+            if (isset($found[$symbol])) {
+                $opens[$symbol] = $found[$symbol];
+                unset($state['missed'][$symbol]);
+            } else {
+                $state['missed'][$symbol] = time();
+            }
+        }
+
+        $state['opens'] = $opens;
+        $tmp = $file . '.tmp';
+
+        if (@file_put_contents($tmp, ttcoin_encode($state), LOCK_EX) !== false) {
+            if (!@rename($tmp, $file)) {
+                @unlink($tmp);
+            }
+        }
+    }
+
+    @flock($lock, LOCK_UN);
+    @fclose($lock);
+
+    return $opens;
+}
+
+/**
  * 从 Binance 拉取一次行情，转换成手表要的定长数组。
  *
  * 每条数据的形状：
  *
  *     {
- *       "symbol": "1000*SHIB",   // 表端直接显示的文本（放大过的带倍数前缀）
+ *       "symbol": "SHIB",        // 表端直接显示的文本（与 base 相同）
  *       "base":   "SHIB",        // 原始简称，菜单勾选 / 缓存按它匹配
- *       "price":  "0.01826",     // 已格式化的字符串，客户端不再做数值格式化
+ *       "price":  "0.0000183",   // 已格式化的字符串，客户端不再做数值格式化
  *       "change": "-1.319"       // 24h 涨跌幅（百分比，不带 % 号）
  *     }
  *
@@ -895,11 +1704,11 @@ function ttcoin_fetch($timeout = 10, $connectTimeout = 5)
         // json_encode()，让编码返回 false，最后把空内容写进缓存文件。
         // 注意保留上游的字符串形态，不要先转 float，否则小数位就丢了。
         //
-        // 小额币种（SHIB 0.00001826）在这里一并放大：按 4 位小数格式化会变成 "0"，
-        // 放大后价格与倍数成对返回，展示时币种名前会加 "1000*" 这样的前缀。
-        $scaled = ttcoin_scale_price($item['lastPrice']);
+        // 小额币种（SHIB 0.00001826）由 ttcoin_format_price() 内部放宽到
+        // 最多 7 位小数；不再做放大换算，也不加倍数前缀。
+        $price = ttcoin_format_price($item['lastPrice']);
 
-        if ($scaled['price'] === null) {
+        if ($price === null) {
             continue;
         }
 
@@ -910,10 +1719,32 @@ function ttcoin_fetch($timeout = 10, $connectTimeout = 5)
             : null;
 
         $prices[$item['symbol']] = [
-            'price'  => $scaled['price'],
-            'factor' => $scaled['factor'],
+            'price'  => $price,
             'change' => $change,
+            'last'   => (string) $item['lastPrice'],   // 原始现价，算自然日涨幅用
         ];
+    }
+
+    // —— 涨幅口径 ——
+    // 24h（默认）：上面 priceChangePercent 原样用，一个字节都不动。
+    // tz：拿「指定时区当日 00:00」的开盘价重算。日开盘价按当地日期缓存，
+    // 一天最多抓一轮；某个币没抓到就保留它的 24h 值，绝不让整接口失败。
+    $changeCfg = ttcoin_change_config();
+
+    if ($changeCfg['mode'] === 'tz') {
+        $opens = ttcoin_day_opens(array_keys($prices), $changeCfg, 4);
+
+        foreach ($prices as $symbol => $row) {
+            if (!isset($opens[$symbol])) {
+                continue;
+            }
+
+            $dayChange = ttcoin_day_change($row['last'], $opens[$symbol]);
+
+            if ($dayChange !== null) {
+                $prices[$symbol]['change'] = $dayChange;
+            }
+        }
     }
 
     // 候选池里哪个币种失败（下架 / 上游缺失）就跳过哪个，
@@ -926,17 +1757,12 @@ function ttcoin_fetch($timeout = 10, $connectTimeout = 5)
             continue;
         }
 
-        $quote  = $prices[$apiSymbol];
-        $factor = $quote['factor'];
-
-        // 放大过的价格，币种名前面加倍数（1000*SHIB），提醒这不是原始报价。
-        // base 始终是原始简称：手表端的菜单勾选、缓存里都用它做匹配，
-        // symbol 只负责"显示成什么"。
+        // symbol 与 base 相同：表端显示什么就匹配什么，不再有倍数前缀。
         $result[] = [
-            'symbol' => $factor > 1 ? $factor . '*' . $label : $label,
+            'symbol' => $label,
             'base'   => $label,
-            'price'  => $quote['price'],
-            'change' => $quote['change'],
+            'price'  => $prices[$apiSymbol]['price'],
+            'change' => $prices[$apiSymbol]['change'],
         ];
     }
 

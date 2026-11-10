@@ -10,6 +10,41 @@ name = "ttcoin-api"
 main = "worker.js"
 compatibility_date = "2026-11-01"
 
+# 行情显示配置（face 滚屏 / 固定 + 三端共用的主币种）—— 仅本地测试，暂不发布。
+# 与 PHP 版 config.php 的配置项一一对应，wrangler dev / deploy 都会读这一段。
+#   FACE_MODE    scroll 滚屏 / fixed 固定（只回一个币）
+#   FACE_ORDER   表盘独立的币种轮播顺序，按 base 匹配，逗号分隔
+#   FACE_FIXED   fixed 模式固定显示哪个币（留空 = ORDER 第一项）
+#   FACE_TOP_N   scroll 模式最多回几条，0 = 按 ORDER 全给
+#   FACE_COIN    三端共用的主币种（留空 = 默认币种）：face 的 fixed / 滚屏
+#                第一位、app / widget 列表的第一位都换成它。支持逗号分隔的
+#                多币种优先级列表（如 "BTC,ETH"），fixed 模式取列表第一个
+#   FACE_IDS     按 ID 覆盖（JSON）：三个客户端请求都带 ?id=（手机端
+#                「行情配置 ID」），登记了哪个 id 就按登记的键覆盖默认一套
+#                （mode/order/fixed/topN/coin 写哪个覆盖哪个，coin 比 fixed
+#                优先）；没登记 / 没带 id 走默认一套（默认币种）。
+#                下面是测试用示例：11111111 固定 DOGE，22222222 滚播，
+#                33333333 主币种换 BTC（coin 也支持多币种列表）。
+#   CHANGE_MODE  涨幅口径：'24h'（默认，上游滚动 24 小时）/
+#                'tz'（指定时区的自然日涨幅，以当地 00:00 开盘价为基准）
+#   CHANGE_TZ    固定 UTC 偏移（不换算夏令时），东八区写 '8'；
+#                0/Z = UTC，-5 = 美东标准时，5:30 或 5.5 = 印度。
+#                tz 模式的日开盘价按「时区 + 当地日期」缓存，一天最多抓一轮，
+#                抓不到的币自动退回 24h；改配置最多 60 秒（FRESH_TTL）生效。
+#   LOG_REQUESTS 每请求一行 JSON 日志（console.log，wrangler tail 可看）：
+#                '1' 默认开（含 id / uid / 客户端 IP / 缓存命中情况），
+#                '0' 全关。Worker 没有文件系统，日志只能走 console.log /
+#                Workers Logs，或另接 Analytics Engine（额外计费，默认不接）。
+[vars]
+FACE_MODE = "scroll"
+FACE_ORDER = "DOGE,BTC,ETH,SHIB,SOL,BNB,XRP,ADA,LINK,LTC,AVAX"
+FACE_FIXED = "DOGE"
+FACE_TOP_N = "0"
+FACE_IDS = '{"11111111":{"mode":"fixed","fixed":"DOGE"},"22222222":{"mode":"scroll"},"33333333":{"coin":"BTC"}}'
+CHANGE_MODE = "24h"
+CHANGE_TZ = "8"
+LOG_REQUESTS = "1"
+
 # 正式接管：域名必须托管在同一个 Cloudflare 账号下。
 #
 # 末尾那个 `*` 不能省：CF 的路由匹配把查询串算进整条 URL，而模式里又不许写
@@ -18,7 +53,7 @@ compatibility_date = "2026-11-01"
 #   "the only way to have a route pattern match URLs with query parameters
 #    is to terminate it with a wildcard, *"
 # routes = [
-#   { pattern = "api.example.com/ttcoin/api/coin.php*", zone_name = "example.com" }
+#   { pattern = "your-domain.example/coin.php*", zone_name = "example.com" }
 # ]
 
 # 可选：日志保留，排查 403 / 上游异常时有用（免费版也有 3 天）
