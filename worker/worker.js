@@ -79,6 +79,8 @@ const FACE_COIN = '';
 //          (现价 - 开盘价) / 开盘价 × 100，跨过当地 00:00 自动归零重算。
 //          日开盘价按「时区 + 当地日期」缓存在 Cache API，一天最多抓一轮；
 //          抓不到的币退回 24h。CHANGE_TZ 是固定 UTC 偏移（不换算夏令时）。
+//          FACE_IDS 里每行还能单独写 "change" 和 "tz"（如 {"change":"tz","tz":"-5"}），
+//          没写就继承全局；每个时区各自一份日开盘价缓存，多时区并存互不覆盖。
 const CHANGE_MODE = '24h';
 const CHANGE_TZ = '8';        // 东八区
 
@@ -329,20 +331,28 @@ export function normalizeTz(raw) {
   return { offsetSec, param, label };
 }
 
-/** 本次请求生效的涨幅配置。nowMs 可注入，方便单测跨日边界。 */
+/**
+ * 按固定偏移算出「当地自然日」三件套：{ tz, day, startMs }。
+ * day = 当地日期（YYYY-MM-DD）；startMs = 当地 00:00 对应的 UTC 毫秒。
+ * 用整数天取整，避免负偏移算出小数。
+ */
+export function tzClock(tz, nowMs = Date.now()) {
+  const shifted = nowMs + tz.offsetSec * 1000;
+
+  return {
+    tz,
+    day: new Date(shifted).toISOString().slice(0, 10),
+    startMs: Math.floor(shifted / 86400000) * 86400000 - tz.offsetSec * 1000,
+  };
+}
+
+/** 全局涨幅配置（CHANGE_MODE / CHANGE_TZ）。nowMs 可注入，方便单测跨日边界。 */
 export function changeConfig(env = {}, nowMs = Date.now()) {
   const raw = String(envPick(env, 'CHANGE_MODE', CHANGE_MODE)).toLowerCase().trim();
   const mode = (raw === 'tz' || raw === 'timezone' || raw === 'day') ? 'tz' : '24h';
   const tz = normalizeTz(envPick(env, 'CHANGE_TZ', CHANGE_TZ)) || normalizeTz('8');
-  const shifted = nowMs + tz.offsetSec * 1000;
 
-  return {
-    mode,
-    tz,
-    day: new Date(shifted).toISOString().slice(0, 10),
-    // 当地 00:00 对应的 UTC 毫秒：用整数天取整，避免负偏移算出小数
-    startMs: Math.floor(shifted / 86400000) * 86400000 - tz.offsetSec * 1000,
-  };
+  return Object.assign({ mode }, tzClock(tz, nowMs));
 }
 
 /** 涨幅百分比 → 最多 3 位小数、去尾零、-0 归 0（与 change 字段同款）。 */
@@ -368,10 +378,16 @@ export function dayChangeOf(item, open) {
   return formatChange(((last - base) / base) * 100);
 }
 
-/** 把「每个币的行情」拼成手表要的数组，顺序固定为 BASES。 */
-export function buildPayload(quotes, opens = {}, cfg = null) {
+/**
+ * 把「每个币的行情」拼成手表要的数组，顺序固定为 BASES。
+ *
+ * day 字段是**按需多时区**的映射：{ "8": "1.23", "-5": "0.98" }——
+ * 全局和每个 id 可以各用各的时区算自然日涨幅，共用同一份缓存互不覆盖；
+ * opensByTz 的键是 tz.param（normalizeTz 的输出），tzList 是本次要算的时区。
+ * 没有一个时区抓到开盘价时 entry.day = {}，出口按口径挑不到就保留 24h。
+ */
+export function buildPayload(quotes, opensByTz = {}, tzList = []) {
   const result = [];
-  const useTz = !!(cfg && cfg.mode === 'tz');
 
   for (const base of BASES) {
     const item = quotes[base];
@@ -382,23 +398,164 @@ export function buildPayload(quotes, opens = {}, cfg = null) {
     const price = formatPrice(item.lastPrice);
     if (price === null) continue;
 
-    // tz 模式：有该币的日开盘价就用自然日涨幅，没抓到就保留 24h（绝不空着）
-    let change = changeOf(item);
-
-    if (useTz && opens[base]) {
-      const day = dayChangeOf(item, opens[base]);
-      if (day !== null) change = day;
-    }
-
-    result.push({
+    // change 永远是上游的滚动 24 小时值（不烘焙口径）；要 tz 口径时另算一份
+    // 自然日涨幅放进 day 字段，出口按「本次请求生效的口径 + 时区」挑选
+    // （见 applyChange）。这样全局口径和按 id 口径可以混用同一份缓存。
+    const entry = {
       symbol: base,
       base: base,
       price: price,
-      change: change,
-    });
+      change: changeOf(item),
+    };
+
+    if (tzList.length > 0) {
+      const days = {};
+
+      for (const clock of tzList) {
+        const param = clock.tz.param;
+        const open = opensByTz[param] && opensByTz[param][base];
+
+        if (!open) continue;
+
+        const day = dayChangeOf(item, open);
+
+        if (day !== null) days[param] = day;
+      }
+
+      entry.day = days;
+    }
+
+    result.push(entry);
   }
 
   return result;
+}
+
+/** FACE_IDS 里是否有 id 把涨幅口径单独设成了 tz（决定要不要多抓一轮日开盘价）。 */
+export function faceIdsNeedTz(env = {}) {
+  let ids = null;
+
+  try {
+    ids = JSON.parse(String(envPick(env, 'FACE_IDS', FACE_IDS)));
+  } catch (e) {
+    return false;
+  }
+
+  if (!ids || typeof ids !== 'object') return false;
+
+  return Object.values(ids).some((one) => one && typeof one === 'object'
+    && String(one.change || '').trim().toLowerCase() === 'tz');
+}
+
+/**
+ * 本次「需要抓日开盘价」的时区列表（去重，元素是 normalizeTz 的结果）。
+ *
+ * 谁会用到 tz 口径：
+ *   - 全局 CHANGE_MODE = tz  → 全局时区
+ *   - 某个 id 的 change = tz → 该 id 自己的 tz，没填就继承全局时区
+ *   - 全局已经是 tz，某个 id 又单独填了 tz → 也要算这个 id 的时区
+ * 一个都没有就返回空数组，一次 K 线都不抓。
+ */
+export function changeTzList(env = {}, change) {
+  const out = [];
+  const add = (tz) => {
+    if (tz && !out.some((x) => x.param === tz.param)) out.push(tz);
+  };
+
+  if (change.mode === 'tz') add(change.tz);
+
+  let ids = null;
+
+  try {
+    ids = JSON.parse(String(envPick(env, 'FACE_IDS', FACE_IDS)));
+  } catch (e) {
+    ids = null;
+  }
+
+  if (ids && typeof ids === 'object') {
+    for (const one of Object.values(ids)) {
+      if (!one || typeof one !== 'object') continue;
+
+      const own = String(one.change === undefined || one.change === null ? '' : one.change)
+        .trim().toLowerCase();
+      const mode = (own === 'tz' || own === '24h') ? own : change.mode;
+
+      if (mode !== 'tz') continue;
+
+      add(normalizeTz(one.tz) || change.tz);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * face 出口实际生效的涨幅配置：id 的 change / tz 优先，空 = 跟随全局。
+ * 返回 { mode, tz, day, startMs }，形状与 changeConfig() 一致，可直接喂 respond。
+ */
+export function faceChange(change, cfg, type = 'face') {
+  const useId = type === 'face' && cfg;
+
+  const own = useId && cfg.chg ? cfg.chg : '';
+  const mode = own || change.mode;
+
+  let clock = { tz: change.tz, day: change.day, startMs: change.startMs };
+
+  if (mode === 'tz' && useId && cfg.chgTz) {
+    const ownTz = normalizeTz(cfg.chgTz);
+
+    if (ownTz && ownTz.param !== change.tz.param) clock = tzClock(ownTz);
+  }
+
+  return { mode, tz: clock.tz, day: clock.day, startMs: clock.startMs };
+}
+
+/**
+ * 出口涨幅口径挑选：tz 模式优先用缓存里的自然日涨幅（day 字段），
+ * 没有（旧缓存 / 当天开盘价没抓到）就保留 24h 值，绝不让 change 空着。
+ * 无论哪种口径都会把内部的 day 字段从出口剥掉，手表只认四件套。
+ *
+ * day 有两种形态：
+ *   { "8": "1.23", "-5": "0.98" }  新缓存：按时区各算一份，按 tzParam 取
+ *   "1.23"                          旧缓存：当时按全局时区算的，兜底直接用
+ * 输入输出都是 JSON 字符串；解析失败原样返回。
+ */
+export function applyChange(text, mode, tzParam = '') {
+  try {
+    const data = JSON.parse(text);
+    if (!Array.isArray(data) || data.length === 0) return text;
+
+    let changed = false;
+    const out = data.map((item) => {
+      if (!item || typeof item !== 'object' || item.day === undefined) return item;
+
+      changed = true;
+      const copy = Object.assign({}, item);
+      const day = copy.day;
+      let value = null;
+
+      if (typeof day === 'string' || typeof day === 'number') {
+        value = String(day);                       // 旧缓存（含 day: null 之外的标量）
+      } else if (day && typeof day === 'object') {
+        if (tzParam && day[tzParam] !== undefined) {
+          value = day[tzParam];
+        } else if (!tzParam) {
+          const keys = Object.keys(day);
+          if (keys.length === 1) value = day[keys[0]];
+        }
+      }
+
+      delete copy.day;
+
+      if (mode === 'tz' && value !== null && value !== '') copy.change = value;
+
+      return copy;
+    });
+
+    return changed ? JSON.stringify(out) : text;
+  } catch (e) {
+    return text;                              // 脏缓存原样返回
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +585,8 @@ export function faceConfig(env = {}, id = '') {
     fixed: String(pick('FACE_FIXED', FACE_FIXED)).trim().toUpperCase(),
     topN: Number.parseInt(pick('FACE_TOP_N', FACE_TOP_N), 10),
     coin: String(pick('FACE_COIN', FACE_COIN)).trim().toUpperCase(),
+    chg: '',                                 // 空 = 涨幅口径跟随全局默认
+    chgTz: '',                               // 空 = 自然日时区跟随全局默认
   };
 
   // —— 按 id 覆盖：登记了哪个键就覆盖哪个键 ——
@@ -462,6 +621,12 @@ export function faceConfig(env = {}, id = '') {
       }
       if (Object.prototype.hasOwnProperty.call(over, 'coin')) {
         raw.coin = String(over.coin).trim().toUpperCase();
+      }
+      if (Object.prototype.hasOwnProperty.call(over, 'change')) {
+        raw.chg = String(over.change).trim().toLowerCase();
+      }
+      if (Object.prototype.hasOwnProperty.call(over, 'tz')) {
+        raw.chgTz = String(over.tz === undefined || over.tz === null ? '' : over.tz).trim();
       }
     }
   }
@@ -521,7 +686,24 @@ export function faceConfig(env = {}, id = '') {
     fixed = coinList[0];
   }
 
-  return { mode, order, fixed, topN, coin, id, idKnown };
+  return {
+    mode,
+    order,
+    fixed,
+    topN,
+    coin,
+    // 涨幅口径按 id 独立设置：'' = 跟随全局默认（CHANGE_MODE）
+    chg: (raw.chg === 'tz' || raw.chg === '24h') ? raw.chg : '',
+    // 自然日时区：'' = 跟随全局（CHANGE_TZ）；存归一化后的参数（"8" / "-5" / "5:30"）
+    chgTz: (function () {
+      if (!raw.chgTz) return '';
+      const tz = normalizeTz(raw.chgTz);
+
+      return tz ? tz.param : '';
+    })(),
+    id,
+    idKnown,
+  };
 }
 
 /**
@@ -780,8 +962,20 @@ async function fetchAll(env = {}) {
   }
 
   const change = changeConfig(env);
-  const opens = change.mode === 'tz' ? await loadDayOpens(sourceOf, change) : {};
-  const data = buildPayload(quotes, opens, change);
+  // 哪些时区要算自然日：全局 tz + 各 id 自己设的 tz（去重后通常 1 个，最多几个）。
+  // 每个时区各自一份开盘价缓存（键里带 tz.param + 当地日期），互不干扰。
+  const tzList = changeTzList(env, change);
+  const opensByTz = {};
+
+  if (tzList.length > 0) {
+    const settled = await Promise.all(tzList.map((tz) => loadDayOpens(sourceOf, tzClock(tz))));
+
+    tzList.forEach((tz, i) => {
+      opensByTz[tz.param] = settled[i];
+    });
+  }
+
+  const data = buildPayload(quotes, opensByTz, tzList);
   const errors = pending.map((base) => base + ': ' + (lastError[base] || 'no data'));
 
   if (data.length === 0) {
@@ -1165,11 +1359,19 @@ async function runDiag(request, env) {
   // 涨幅口径：把「24h / tz」和 tz 模式实际拿到的日开盘价一起打出来，
   // ?diag=1 就能确认东八区零点价抓到了几个、有没有回退到 24h。
   const change = changeConfig(env);
+  const tzList = changeTzList(env, change);
   lines.push('');
-  lines.push('涨幅口径：mode=' + change.mode + '  tz=' + change.tz.label +
+  lines.push('涨幅口径：mode=' + change.mode + '  全局 tz=' + change.tz.label +
     '  day=' + change.day + '  当地 00:00 UTC=' + new Date(change.startMs).toISOString());
-  if (change.mode === 'tz' && fetched.data) {
-    lines.push('自然日涨幅：' + fetched.data.map((x) => x.base + ' ' + x.change).join(' | '));
+  lines.push('算自然日的时区：' + (tzList.length
+    ? tzList.map((x) => x.label + '(' + x.param + ')').join(' | ')
+    : '无（全部走 24h）'));
+
+  if (tzList.length && fetched.data) {
+    lines.push('自然日涨幅（day 字段）：' + fetched.data.slice(0, 4).map((x) =>
+      x.base + ' ' + tzList.map((tz) => tz.param + '=' +
+        (x.day && x.day[tz.param] !== undefined ? x.day[tz.param] : '-')).join('/')
+    ).join(' | '));
   }
 
   // 顺带把 face 配置和「按这个配置真实过一遍出口」的结果打出来，
@@ -1215,6 +1417,10 @@ export default {
 
     // 网页后台（/admin）在最前面分发：后台流量不进行情缓存、不写请求日志。
     // 设置存 KV（admin_settings 键），保存即生效，不用 wrangler deploy。
+    if (url.pathname === '/owner' || url.pathname.startsWith('/owner/')) {
+      return handleOwner(request, env, url);
+    }
+
     if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
       return handleAdmin(request, env, url);
     }
@@ -1238,6 +1444,10 @@ export default {
     // 设备匿名标识（?uid=）：只进响应头 + 日志，不进缓存键（见 clientUid 注释）
     const uid = clientUid(url);
     const change = changeConfig(env);
+    // 涨幅口径 + 时区：face 按 id 独立设置优先，没设 / 其他形态跟随全局
+    const chg = faceChange(change, cfg, type);
+    const chgTz = chg.mode === 'tz' ? chg.tz.param : '';
+    const changeEcho = { mode: chg.mode, tz: chg.tz, day: chg.day, startMs: chg.startMs };
     const cache = caches.default;
 
     // 每个出口都要带上的「谁在请求」信息：响应头回显 uid、日志记 id / uid / IP
@@ -1252,12 +1462,12 @@ export default {
       const text = await hit.text();
       const age = Number(hit.headers.get('X-TTCoin-Stored') || 0);
       const seconds = age > 0 ? Math.max(0, Math.round(Date.now() / 1000 - age)) : 0;
-      return respond(trim(text, type, cfg), {
+      return respond(trim(text, type, cfg, chg.mode, chgTz), {
         ...who,
         cache: 'HIT',
         face,
         coin: cfg.coin,
-        change,
+        change: changeEcho,
         age: seconds,
         sources: hit.headers.get('X-TTCoin-Source') || 'cache',
       });
@@ -1292,12 +1502,12 @@ export default {
 
       await cache.put(staleKey, stale);
 
-      return respond(trim(full, type, cfg), {
+      return respond(trim(full, type, cfg, chg.mode, chgTz), {
         ...who,
         cache: 'MISS',
         face,
         coin: cfg.coin,
-        change,
+        change: changeEcho,
         sources: fetched.sources,
         degraded: fetched.error !== '',
       });
@@ -1310,12 +1520,12 @@ export default {
       const text = await staleHit.text();
       const stored = Number(staleHit.headers.get('X-TTCoin-Stored') || 0);
       const age = stored > 0 ? Math.round(Date.now() / 1000 - stored) : 0;
-      return respond(trim(text, type, cfg), {
+      return respond(trim(text, type, cfg, chg.mode, chgTz), {
         ...who,
         cache: 'STALE',
         face,
         coin: cfg.coin,
-        change,
+        change: changeEcho,
         age,
         sources: staleHit.headers.get('X-TTCoin-Source') || 'cache',
         degraded: true,
@@ -1361,16 +1571,19 @@ export default {
  * 出口整形，与 PHP 版 ttcoin_filter_output() 一致：**缓存里始终是完整列表**，
  * 裁剪 / 重排只发生在出口，所以三种形态混访不会触发二次抓取。
  *
+ *   涨幅口径 → applyChange()：face 按 id 独立设置优先，没设 / 其他形态走全局
  *   face    → faceOutput()：按独立顺序重排；fixed 只回一条，scroll 回前 N 条
  *   widget  → 主币种排前（coin 配了才动）→ 只回前 WIDGET_TOP_N 项
  *   app     → 主币种排前（coin 配了才动），其余原样
  *   其他    → 原样
  */
-function trim(text, type, cfg) {
-  if (type === 'face') return faceOutput(text, cfg || faceConfig());
+function trim(text, type, cfg, chgMode, tzParam) {
+  let out = applyChange(text, chgMode || '24h', tzParam || '');
+
+  if (type === 'face') return faceOutput(out, cfg || faceConfig());
 
   // app / widget：登记的 id 配了 coin 时，把主币种排到最前（没配 = 原样）
-  let out = coinFirst(text, cfg ? cfg.coin : '');
+  out = coinFirst(out, cfg ? cfg.coin : '');
 
   if (type !== 'widget') return out;
 
@@ -1389,12 +1602,22 @@ function trim(text, type, cfg) {
 //   1) npx wrangler kv namespace create SETTINGS   → 把返回的 id 填进 wrangler.toml
 //   2) npx wrangler secret put ADMIN_TOKEN         → 自定一个长口令（后台登录用）
 // 不绑 KV / 不设口令时行情出口完全不受影响，/admin 只会显示设置说明。
+// 设备管理码 + 设备用户后台（/owner，独立入口）：管理员在「设备管理码」卡里
+// 给每个设备 ID 生成一个码（存 KV admin_ids），设备用户打开 /owner 用
+// ID + 码登录，只能改自己那一行的独立配置（mode/fixed/coin/topN/order/change），
+// 看不到全局配置和日志。/admin 不受理设备登录、/owner 不显示管理员口令，
+// 两套 cookie（ttcoin_admin / ttcoin_owner）互不相干；
+// 管理码行数很少，读写不占日志的聚合写额度。
 // ---------------------------------------------------------------------------
 
 const ADMIN_KV_KEY = 'admin_settings';
 const ADMIN_COOKIE = 'ttcoin_admin';
 const ADMIN_SESSION_TTL = 7 * 86400;      // 登录态 7 天
 const ADMIN_KV_CACHE_TTL = 30000;         // 隔离实例内缓存 30 秒，控制 KV 读成本
+
+// 设备管理码：{ "TCxxxx": { code, t } }，设备用户用 ID+管理码登录后只能改自己那行
+const ADMIN_IDS_KEY = 'admin_ids';
+const ADMIN_COOKIE_OWNER = 'ttcoin_owner';
 
 /** KV 设置的隔离实例缓存：{ data: 对象或 null, t: 加载时间 } */
 let adminKvCache = { data: null, t: 0 };
@@ -1475,6 +1698,67 @@ async function adminAuthed(request, env) {
   return !!match && ctEqual(match[1], await adminSig(token));
 }
 
+// ---------------------------------------------------------------------------
+// 设备管理码：管理员给每个设备 ID 发一个码，设备用户用「ID + 码」登录后
+// 只能改自己那一行的独立配置（mode/fixed/coin/topN/order），看不到全局配置
+// 与日志。码存 KV（admin_ids），登录态是与 ADMIN_TOKEN 绑定的 HMAC cookie。
+// ---------------------------------------------------------------------------
+
+/** 8 位无歧义字符随机码（去掉 0/O/1/I/L）。 */
+function randomCode() {
+  const alphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+  const bytes = new Uint8Array(8);
+
+  crypto.getRandomValues(bytes);
+
+  return [...bytes].map(b => alphabet[b % alphabet.length]).join('');
+}
+
+/** 设备登录态签名：绑定 ADMIN_TOKEN 与具体 ID，换口令或换 ID 都会失效。 */
+async function ownerSig(token, id) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(token + ':' + id), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('ttcoin-owner-v1'));
+
+  return [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 40);
+}
+
+/** 校验设备用户登录态，返回设备 ID 或 null。 */
+async function ownerAuthed(request, env) {
+  const token = adminToken(env);
+
+  if (!token) return null;
+
+  const match = /(?:^|;\s*)ttcoin_owner=([A-Za-z0-9]{1,32})\.([0-9a-f]{40})(?:;|$)/
+    .exec(request.headers.get('Cookie') || '');
+
+  if (!match) return null;
+
+  const ok = ctEqual(match[2], await ownerSig(token, match[1]));
+
+  return ok ? match[1] : null;
+}
+
+async function loadIdCodes(env) {
+  try {
+    const raw = await env.SETTINGS.get(ADMIN_IDS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+async function saveIdCodes(env, codes) {
+  if (Object.keys(codes).length) {
+    await env.SETTINGS.put(ADMIN_IDS_KEY, JSON.stringify(codes));
+  } else {
+    await env.SETTINGS.delete(ADMIN_IDS_KEY);
+  }
+}
+
 /** POST 一律校验 Origin（没有 Origin 头的算同源，如 curl 直调）。 */
 function adminSameOrigin(request) {
   const origin = request.headers.get('Origin');
@@ -1515,6 +1799,75 @@ function adminCoinList(raw) {
   }
 
   return { ok: true, list: list };
+}
+
+/**
+ * 校验单个 ID 的覆盖项（mode / fixed / coin / topN / order / change），与 PHP 版
+ * admin_clean_id_over() 同一套规则。错误 push 进 errors，返回清洗后的 one
+ * （可能为空对象 = 全部继承默认，仍保留登记身份）。
+ * 管理员保存（adminValidate）和设备用户保存（owner/save）共用。
+ */
+export function adminCleanIdOne(id, value, errors) {
+  const one = {};
+  let bad = false;
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+
+  const m = String(src.mode || '').trim().toLowerCase();
+  if (m && m !== 'scroll' && m !== 'fixed') {
+    errors.push('ID ' + id + ' 的 mode 只能是 scroll / fixed'); bad = true;
+  } else if (m) {
+    one.mode = m;
+  }
+
+  const chg = String(src.change || '').trim().toLowerCase();
+  if (chg && chg !== '24h' && chg !== 'tz') {
+    errors.push('ID ' + id + ' 的 change 只能是 24h / tz'); bad = true;
+  } else if (chg) {
+    one.change = chg;
+  }
+
+  // 该 id 的自然日时区（只在 change=tz 或全局 tz 时生效）；空 = 继承全局
+  const tzRaw = String(src.tz === undefined || src.tz === null ? '' : src.tz).trim();
+  if (tzRaw) {
+    const tz = normalizeTz(tzRaw);
+    if (!tz) {
+      errors.push('ID ' + id + ' 的涨幅时区写得不对（示例：8 / -5 / 5:30）'); bad = true;
+    } else {
+      one.tz = tz.param;
+    }
+  }
+
+  const fx = String(src.fixed || '').trim().toUpperCase();
+  if (fx && !BASES.includes(fx)) {
+    errors.push('ID ' + id + ' 的 fixed 币种不支持：' + fx); bad = true;
+  } else if (fx) {
+    one.fixed = fx;
+  }
+
+  const cn = adminCoinList(src.coin);
+  if (!cn.ok) {
+    errors.push('ID ' + id + ' 的 coin 有不支持的币种：' + cn.bad); bad = true;
+  } else if (cn.list.length) {
+    one.coin = cn.list.join(',');
+  }
+
+  if (src.topN !== undefined && src.topN !== null && String(src.topN).trim() !== '') {
+    const n = Number.parseInt(src.topN, 10);
+    if (!Number.isInteger(n) || n < 0 || n > BASES.length) {
+      errors.push('ID ' + id + ' 的 topN 必须是 0~' + BASES.length); bad = true;
+    } else {
+      one.topN = n;
+    }
+  }
+
+  const od = adminCoinList(src.order);
+  if (!od.ok) {
+    errors.push('ID ' + id + ' 的 order 有不支持的币种：' + od.bad); bad = true;
+  } else if (od.list.length) {
+    one.order = od.list.join(',');
+  }
+
+  return bad ? null : one;
 }
 
 /**
@@ -1637,49 +1990,10 @@ export function adminValidate(input) {
       const id = String(key).replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
 
       if (!id) continue;   // 空 ID 行直接丢弃
-      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
 
-      const one = {};
-      let bad = false;
+      const one = adminCleanIdOne(id, value, errors);
 
-      const m = String(value.mode || '').trim().toLowerCase();
-      if (m && m !== 'scroll' && m !== 'fixed') {
-        errors.push('ID ' + id + ' 的 mode 只能是 scroll / fixed'); bad = true;
-      } else if (m) {
-        one.mode = m;
-      }
-
-      const fx = String(value.fixed || '').trim().toUpperCase();
-      if (fx && !BASES.includes(fx)) {
-        errors.push('ID ' + id + ' 的 fixed 币种不支持：' + fx); bad = true;
-      } else if (fx) {
-        one.fixed = fx;
-      }
-
-      const cn = adminCoinList(value.coin);
-      if (!cn.ok) {
-        errors.push('ID ' + id + ' 的 coin 有不支持的币种：' + cn.bad); bad = true;
-      } else if (cn.list.length) {
-        one.coin = cn.list.join(',');
-      }
-
-      if (value.topN !== undefined && value.topN !== null && String(value.topN).trim() !== '') {
-        const n = Number.parseInt(value.topN, 10);
-        if (!Number.isInteger(n) || n < 0 || n > BASES.length) {
-          errors.push('ID ' + id + ' 的 topN 必须是 0~' + BASES.length); bad = true;
-        } else {
-          one.topN = n;
-        }
-      }
-
-      const od = adminCoinList(value.order);
-      if (!od.ok) {
-        errors.push('ID ' + id + ' 的 order 有不支持的币种：' + od.bad); bad = true;
-      } else if (od.list.length) {
-        one.order = od.list.join(',');
-      }
-
-      if (!bad && Object.keys(one).length) ids[id] = one;
+      if (one && Object.keys(one).length) ids[id] = one;
     }
 
     if (Object.keys(ids).length) clean.FACE_IDS = JSON.stringify(ids);
@@ -1702,6 +2016,218 @@ export function adminValidate(input) {
 }
 
 /** 后台各入口的分发。 */
+/**
+ * 设备用户后台（/owner）：与管理员后台（/admin）完全分开的两个入口。
+ * /admin 不再受理设备登录，/owner 也不出现管理员口令；两套 cookie 独立
+ * （ADMIN_COOKIE / ADMIN_COOKIE_OWNER），互不影响。
+ *
+ * 页面就是一张登录卡（设备 ID + 管理码），登录后只显示自己那一行的
+ * 模式 / 固定币 / 主币种 / 条数 / 顺序 / 涨幅口径，可预览、保存。
+ */
+async function handleOwner(request, env, url) {
+  const path = url.pathname.replace(/\/+$/, '') || '/owner';
+  const token = adminToken(env);
+  const hasKv = !!(env && env.SETTINGS && typeof env.SETTINGS.get === 'function');
+  const method = request.method;
+
+  if (method !== 'GET' && method !== 'POST') return adminJson({ ok: false, message: 'method' }, 405);
+  if (method === 'POST' && !adminSameOrigin(request)) {
+    return adminJson({ ok: false, message: 'Origin 校验失败' }, 403);
+  }
+
+  if (path === '/owner' && method === 'GET') {
+    return new Response(ownerPage(), {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Robots-Tag': 'noindex',
+      },
+    });
+  }
+
+  // —— 设备用户登录：ID + 管理码（不需要管理员口令）——
+  if (path === '/owner/api/login' && method === 'POST') {
+    if (!token) return adminJson({ ok: false, message: '服务端未设置 ADMIN_TOKEN，管理码登录不可用' }, 400);
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV，管理码不可用' }, 400);
+
+    const body = await adminReadJson(request);
+    const id = String((body && body.id) || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+    const code = String((body && body.code) || '').trim().toUpperCase();
+    const codes = await loadIdCodes(env);
+    const got = codes[id] && codes[id].code ? String(codes[id].code) : '';
+
+    // 不区分「ID 不存在」和「码不对」，不给试探的人反馈哪一步错了
+    if (!id || !got || !ctEqual(got, code)) {
+      return adminJson({ ok: false, message: 'ID 或管理码不对' }, 401);
+    }
+
+    return adminJson({ ok: true, id: id }, 200, {
+      'Set-Cookie': ADMIN_COOKIE_OWNER + '=' + id + '.' + (await ownerSig(token, id)) +
+        '; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=' + ADMIN_SESSION_TTL,
+    });
+  }
+
+  if (path === '/owner/api/logout' && method === 'POST') {
+    return adminJson({ ok: true }, 200, {
+      'Set-Cookie': ADMIN_COOKIE_OWNER + '=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+    });
+  }
+
+  // —— 以下 owner 接口只认设备登录态，与管理员登录互不相干 ——
+  const ownerId = await ownerAuthed(request, env);
+
+  if (path === '/owner/api/get' && method === 'GET') {
+    if (!ownerId) return adminJson({ ok: false, message: '未登录' }, 401);
+
+    const merged = await effectiveEnv(env);
+    let ids = {};
+
+    try {
+      ids = JSON.parse(String(envPick(merged, 'FACE_IDS', FACE_IDS))) || {};
+    } catch (e) {
+      ids = {};
+    }
+
+    return adminJson({
+      ok: true,
+      id: ownerId,
+      one: ids[ownerId] && typeof ids[ownerId] === 'object' ? ids[ownerId] : {},
+    });
+  }
+
+  if (path === '/owner/api/save' && method === 'POST') {
+    if (!ownerId) return adminJson({ ok: false, message: '未登录' }, 401);
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV' }, 400);
+
+    const body = await adminReadJson(request);
+    const errors = [];
+    const one = adminCleanIdOne(ownerId, body && body.over, errors);
+
+    if (errors.length) {
+      return adminJson({ ok: false, message: '有 ' + errors.length + ' 项没通过校验', errors: errors }, 422);
+    }
+
+    // 与 PHP 版同一策略：读原始 KV 设置，只改 FACE_IDS 自己那行，其它键原样保留
+    // 显式标注类型：否则 TS 会从 `raw.FACE_IDS = ...` 反推出「必带 FACE_IDS」的形状，
+    // 回头把 `raw = {}` 判成缺属性（ts2741），编辑器里一直飘红。
+    /** @type {Record<string, any>} */
+    let raw = {};
+
+    try {
+      const s = await env.SETTINGS.get(ADMIN_KV_KEY);
+
+      if (s) raw = JSON.parse(s);
+    } catch (e) {
+      raw = {};
+    }
+
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+
+    let ids = {};
+
+    if (raw.FACE_IDS) {
+      try {
+        ids = JSON.parse(raw.FACE_IDS) || {};
+      } catch (e) {
+        ids = {};
+      }
+    }
+
+    ids[ownerId] = one;
+    raw.FACE_IDS = JSON.stringify(ids);
+
+    await env.SETTINGS.put(ADMIN_KV_KEY, JSON.stringify(raw));
+
+    try {
+      adminKvCache = { data: JSON.parse(await env.SETTINGS.get(ADMIN_KV_KEY)), t: Date.now() };
+    } catch (e) {
+      adminKvCache = { data: null, t: 0 };
+    }
+
+    // 与管理员保存同一条软提醒：全局 coin 优先于行内 fixed
+    const warnings = [];
+    const globalCoin = String(envPick(raw, 'FACE_COIN', '')).trim().toUpperCase();
+
+    if (one.fixed && globalCoin) {
+      const first = globalCoin.split(',')[0];
+      const ownFirst = one.coin ? one.coin.split(',')[0] : '';
+
+      if (!ownFirst && first !== one.fixed) {
+        warnings.push('全局主币种是 ' + first + '（coin 优先，会覆盖固定币）；要固定 ' +
+          one.fixed + '，请把主币种也填成 ' + one.fixed);
+      } else if (ownFirst && ownFirst !== one.fixed) {
+        warnings.push('固定币是 ' + one.fixed + '，但主币种第一项是 ' + ownFirst + '，实际会显示 ' + ownFirst);
+      }
+    }
+
+    return adminJson({
+      ok: true,
+      message: '已保存，约 30 秒内全局生效',
+      warnings: warnings,
+    });
+  }
+
+  if (path === '/owner/api/preview' && method === 'POST') {
+    if (!ownerId) return adminJson({ ok: false, message: '未登录' }, 401);
+
+    const body = await adminReadJson(request);
+    const errors = [];
+    const one = adminCleanIdOne(ownerId, body && body.over, errors);
+
+    if (errors.length) {
+      return adminJson({ ok: false, message: '有 ' + errors.length + ' 项没通过校验', errors: errors }, 422);
+    }
+
+    const merged = await effectiveEnv(env);
+    let ids = {};
+
+    try {
+      ids = JSON.parse(String(envPick(merged, 'FACE_IDS', FACE_IDS))) || {};
+    } catch (e) {
+      ids = {};
+    }
+
+    // 预览 = 已保存配置 + 本次覆盖合并（本次没填的项保留已保存值），
+    // 否则保存过的涨幅口径之类会被预览悄悄丢掉，显示结果和保存后不一致
+    const savedOne = ids[ownerId] && typeof ids[ownerId] === 'object' ? ids[ownerId] : {};
+
+    ids[ownerId] = Object.assign({}, savedOne, one);
+
+    // 候选要带全当前生效的全局值（effectiveEnv 合并后的），FACE_IDS 换成合并结果
+    const cfg = faceConfig({
+      FACE_MODE: envPick(merged, 'FACE_MODE', FACE_MODE),
+      FACE_ORDER: envPick(merged, 'FACE_ORDER', FACE_ORDER),
+      FACE_FIXED: envPick(merged, 'FACE_FIXED', FACE_FIXED),
+      FACE_TOP_N: envPick(merged, 'FACE_TOP_N', FACE_TOP_N),
+      FACE_COIN: envPick(merged, 'FACE_COIN', FACE_COIN),
+      FACE_IDS: JSON.stringify(ids),
+    }, ownerId);
+    const out = JSON.parse(faceOutput(ADMIN_SAMPLE, cfg) || '[]');
+    // 实际生效的涨幅口径（含 id 自己的时区），预览里一并回显
+    const effChg = faceChange(changeConfig(merged), cfg, 'face');
+
+    return adminJson({
+      ok: true,
+      id: ownerId,
+      known: cfg.idKnown,
+      config: {
+        mode: cfg.mode,
+        fixed: cfg.fixed,
+        topN: cfg.topN,
+        coin: cfg.coin,
+        chg: cfg.chg,
+        chgTz: cfg.chgTz,
+        chgTzLabel: effChg.mode === 'tz' ? effChg.tz.label : '',
+        order: cfg.order.join(','),
+      },
+      count: out.length,
+      coins: out.map(item => item.symbol),
+    });
+  }
+
+  return adminJson({ ok: false, message: 'not found' }, 404);
+}
+
 async function handleAdmin(request, env, url) {
   const path = url.pathname.replace(/\/+$/, '') || '/admin';
   const token = adminToken(env);
@@ -1752,9 +2278,48 @@ async function handleAdmin(request, env, url) {
     });
   }
 
-  // —— 以下接口都要登录 ——
+  // —— 以下接口都要管理员登录（设备用户的接口全部在 /owner，见 handleOwner）——
   if (!token) return adminJson({ ok: false, message: '未设置 ADMIN_TOKEN' }, 400);
   if (!(await adminAuthed(request, env))) return adminJson({ ok: false, message: '未登录' }, 401);
+
+  // —— 设备管理码维护（管理员）——
+  if (path === '/admin/api/codes' && method === 'GET') {
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV，管理码不可用' }, 400);
+
+    return adminJson({ ok: true, codes: await loadIdCodes(env) });
+  }
+
+  if (path === '/admin/api/codes/set' && method === 'POST') {
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV，管理码不可用' }, 400);
+
+    const body = await adminReadJson(request);
+    const id = String((body && body.id) || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
+
+    if (!id) return adminJson({ ok: false, message: 'ID 不能为空' }, 422);
+
+    let code = String((body && body.code) || '').trim().toUpperCase();
+    const codes = await loadIdCodes(env);
+
+    if (!code) {
+      delete codes[id];
+
+      await saveIdCodes(env, codes);
+
+      return adminJson({ ok: true, message: '已删除 ' + id + ' 的管理码' });
+    }
+
+    if (code === 'AUTO') {
+      code = randomCode();
+    } else if (code.length < 6 || code.length > 32) {
+      return adminJson({ ok: false, message: '管理码长度要在 6 到 32 位之间（auto = 自动生成）' }, 422);
+    }
+
+    codes[id] = { code: code, t: Math.floor(Date.now() / 1000) };
+
+    await saveIdCodes(env, codes);
+
+    return adminJson({ ok: true, message: '已保存', code: code });
+  }
 
   if (path === '/admin/api/settings' && method === 'GET') {
     const merged = await effectiveEnv(env);
@@ -1874,7 +2439,7 @@ async function handleAdmin(request, env, url) {
       ok: true,
       id: id,
       known: cfg.idKnown,
-      config: { mode: cfg.mode, fixed: cfg.fixed, topN: cfg.topN, coin: cfg.coin, order: cfg.order.join(',') },
+      config: { mode: cfg.mode, fixed: cfg.fixed, topN: cfg.topN, coin: cfg.coin, chg: cfg.chg, chgTz: cfg.chgTz, order: cfg.order.join(',') },
       count: out.length,
       coins: out.map(item => item.symbol),
       warnings: warnings,
@@ -1923,6 +2488,192 @@ async function handleAdmin(request, env, url) {
 }
 
 /** 后台页面：骨架 + 前端脚本，状态由 /admin/api/state 驱动。 */
+/**
+ * 设备用户页面（/owner）：登录卡 + 自己那一行的配置面板。
+ * 与 adminPage 完全分开：这里没有管理员口令入口，/admin 也没有设备登录。
+ */
+function ownerPage() {
+  const state = JSON.stringify({ bases: BASES }).replace(/<\//g, '<\\/');
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TTCoin 设备管理</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#e2e7ec;--text:#1c2733;--muted:#6b7a89;--accent:#0b7285;--ok:#0b5f59;--bad:#a61e4d;--warn:#946c00}
+*{box-sizing:border-box}
+html,body{max-width:100%;overflow-x:hidden}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:24px 16px 60px}
+.auth-wrap{max-width:380px;margin:8vh auto 0}
+.wrap{max-width:640px;margin:0 auto;display:none}
+h1{font-size:19px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:12.5px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px}
+label{display:block;font-size:12.5px;color:var(--muted);margin:10px 0 4px}
+input[type=text],input[type=number],select{width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:7px;font:inherit;background:#fff;color:var(--text)}
+input[type=number]{max-width:110px}
+.mono{font-family:ui-monospace,Consolas,monospace}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.hint{font-size:12px;color:var(--muted);margin-top:6px}
+button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--text);border-radius:7px;padding:7px 14px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{opacity:.9;color:#fff}
+button:disabled{opacity:.5;cursor:default}
+.msg{padding:9px 12px;border-radius:8px;font-size:13px;margin:10px 0;display:none}
+.msg.ok{background:#e6f4f1;color:var(--ok);display:block}
+.msg.bad{background:#fbe9ef;color:var(--bad);display:block}
+.msg.warn{background:#fdf6e3;color:var(--warn);display:block;white-space:pre-line}
+.preview{background:#10222b;color:#d8e6ee;border-radius:8px;padding:10px 12px;font:12px/1.7 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;display:none}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+@media(max-width:480px){body{padding:14px 10px 40px}.card{padding:13px 12px}input[type=number]{max-width:none;width:100%}}
+</style>
+</head>
+<body>
+<div id="login" class="auth-wrap">
+  <div class="card">
+    <h1>TTCoin 设备管理</h1>
+    <div class="sub">输入自己的设备 ID 和管理员发的管理码</div>
+    <label>设备 ID</label>
+    <input type="text" id="ownerIdIn" class="mono" maxlength="32" placeholder="TC…" autocomplete="off">
+    <label>管理码</label>
+    <input type="text" id="ownerCodeIn" class="mono" maxlength="32" placeholder="管理员发给你那个" autocomplete="off">
+    <div class="row" style="margin-top:14px"><button class="primary" id="ownerLoginBtn" style="width:100%">登录</button></div>
+    <div class="hint">只能改自己设备的显示配置，看不到全局设置和日志；管理码找管理员要。管理员后台在 /admin，两套登录互不相干。</div>
+  </div>
+</div>
+
+<div id="panel" class="wrap">
+  <h1>我的行情配置 · 设备 <span id="ownerTag" class="mono"></span></h1>
+  <div class="sub">改动只影响这台设备<span class="saved"></span></div>
+  <div id="msg" class="msg"></div>
+  <div class="card">
+    <label>模式</label>
+    <select id="oMode"><option value="">跟随默认</option><option value="scroll">scroll 滚屏</option><option value="fixed">fixed 固定</option></select>
+    <label>固定币（fixed 模式生效）</label>
+    <select id="oFixed"></select>
+    <label>主币种（排最前，可多个，逗号分隔）</label>
+    <input type="text" id="oCoin" placeholder="留空 = 继承默认">
+    <div class="row" style="margin-top:10px">
+      <div><label>条数上限（scroll 模式）</label><input type="number" id="oTopn" min="0" max="11" placeholder="留空 = 继承" style="max-width:110px"></div>
+    </div>
+    <label>顺序（可选，逗号分隔币种）</label>
+    <input type="text" id="oOrder" placeholder="留空 = 继承默认顺序">
+    <label>涨幅口径</label>
+    <select id="oChg">
+      <option value="">跟随默认</option>
+      <option value="24h">24h（滚动 24 小时）</option>
+      <option value="tz">自然日（按时区）</option>
+    </select>
+    <div class="row" style="margin-top:10px">
+      <div><label>自然日时区偏移</label><input type="text" id="oTz" placeholder="留空 = 跟随默认（8 / -5 / 5:30）" style="max-width:220px"></div>
+    </div>
+    <div class="hint">自然日：以「该时区当日 00:00」开盘价为基准重算涨幅；时区只在这台选自然日（或全局默认就是自然日）时生效。留空的项 = 继承管理员的全局默认；主币种（coin）优先于固定币（fixed）。</div>
+    <div class="actions">
+      <button class="primary" id="oSave">保存并生效</button>
+      <button id="oPreview">预览</button>
+      <button id="oLogout">退出</button>
+    </div>
+    <div class="preview" id="oPvOut"></div>
+  </div>
+</div>
+<script>
+const CFG = ${state};
+const API = '/owner/api/';
+const $ = id => document.getElementById(id);
+
+function show(el, on){ el.style.display = on ? '' : 'none'; }
+function msg(text, cls){
+  const el = $('msg');
+  el.textContent = text || '';
+  el.className = 'msg' + (cls ? ' ' + cls : '');
+  if (!text) el.className = 'msg';
+}
+async function post(name, body, method){
+  const m = method || 'POST';
+  const init = { method: m, headers: { 'Content-Type': 'application/json' } };
+  if (m !== 'GET' && body !== undefined && body !== null) init.body = JSON.stringify(body);
+  const r = await fetch(API + name, init);
+  let j = null;
+  try { j = await r.json(); } catch (e) { j = { ok: false, message: 'HTTP ' + r.status }; }
+  return j;
+}
+function baseOptions(sel, placeholder){
+  sel.innerHTML = '<option value="">' + placeholder + '</option>' +
+    CFG.bases.map(b => '<option value="' + b + '">' + b + '</option>').join('');
+}
+
+async function ownerBoot(){
+  const j = await post('get', null, 'GET');
+  if (!j.ok) { show($('login'), true); show($('panel'), false); return; }
+  show($('login'), false);
+  show($('panel'), true);
+  $('ownerTag').textContent = j.id;
+  const one = j.one || {};
+  $('oMode').value = one.mode || '';
+  baseOptions($('oFixed'), '（留空 = 继承默认）');
+  $('oFixed').value = one.fixed || '';
+  $('oCoin').value = one.coin || '';
+  $('oTopn').value = (one.topN === undefined || one.topN === null) ? '' : one.topN;
+  $('oOrder').value = one.order || '';
+  $('oChg').value = one.change || '';
+  $('oTz').value = one.tz || '';
+}
+function ownerCollect(){
+  const over = {};
+  if ($('oMode').value) over.mode = $('oMode').value;
+  if ($('oFixed').value) over.fixed = $('oFixed').value;
+  const cn = $('oCoin').value.trim(); if (cn) over.coin = cn;
+  const tn = $('oTopn').value.trim(); if (tn !== '') over.topN = parseInt(tn, 10);
+  const od = $('oOrder').value.trim(); if (od) over.order = od;
+  const chg = $('oChg').value; if (chg) over.change = chg;
+  const tz = $('oTz').value.trim(); if (tz) over.tz = tz;
+  return over;
+}
+$('ownerLoginBtn').onclick = async () => {
+  const j = await post('login', { id: $('ownerIdIn').value.trim(), code: $('ownerCodeIn').value.trim() });
+  if (j.ok) ownerBoot(); else msg(j.message || '登录失败', 'bad');
+};
+$('ownerCodeIn').addEventListener('keydown', e => { if (e.key === 'Enter') $('ownerLoginBtn').click(); });
+$('oSave').onclick = async () => {
+  const btn = $('oSave');
+  btn.disabled = true;
+  const j = await post('save', { over: ownerCollect() });
+  btn.disabled = false;
+  if (j.ok) msg(j.message + ((j.warnings || []).length ? '\\n⚠ ' + j.warnings.join('\\n⚠ ') : ''), j.warnings && j.warnings.length ? 'warn' : 'ok');
+  else msg((j.errors || [j.message]).join('\\n'), 'bad');
+};
+$('oPreview').onclick = async () => {
+  const out = $('oPvOut');
+  out.style.display = 'block';
+  try {
+    const j = await post('preview', { over: ownerCollect() });
+    if (!j.ok) { out.textContent = (j.errors || [j.message || '预览失败']).join('\\n'); return; }
+    out.textContent = [
+      'mode=' + j.config.mode + '  fixed=' + (j.config.fixed || '-') + '  topN=' + j.config.topN + '  coin=' + (j.config.coin || '-'),
+      '涨幅口径=' + (j.config.chg ? (j.config.chg === 'tz' ? '自然日' : '24h') : '跟随全局默认') +
+        (j.config.chgTzLabel ? '  时区=' + j.config.chgTzLabel : ''),
+      'order=' + j.config.order,
+      '表盘会收到 ' + j.count + ' 条：' + j.coins.join(' → '),
+    ].join('\\n');
+  } catch (e) {
+    out.textContent = '预览请求失败：' + (e && e.message ? e.message : e);
+  }
+};
+$('oLogout').onclick = async () => {
+  await post('logout');
+  show($('panel'), false);
+  show($('login'), true);
+};
+ownerBoot();
+</script>
+</body>
+</html>`;
+}
+
 function adminPage() {
   const state = JSON.stringify({ bases: BASES }).replace(/<\//g, '<\\/');
 
@@ -1964,6 +2715,10 @@ td input,td select{max-width:none;padding:5px 8px}
 #idsTable td input,#idsTable td select{width:100%}
 #idsTable td:last-child{white-space:nowrap;text-align:right}
 td .num{max-width:70px}
+/* 按 ID 表新加的「时区」列：窄一点，别把整张表撑宽 */
+#idsTable .i-tz{max-width:78px}
+/* 9 列的按 ID 表在窄一点的桌面窗口里可能超出卡片：给个横向滚动兜底 */
+.table-scroll{overflow-x:auto}
 .msg{padding:9px 12px;border-radius:8px;font-size:13px;margin:10px 0;display:none}
 .msg.ok{background:#e6f4f1;color:var(--ok);display:block}
 .msg.bad{background:#fbe9ef;color:var(--bad);display:block}
@@ -1975,6 +2730,8 @@ ul{margin:6px 0 0;padding-left:18px}
 .log-wrap table{margin:0}
 .log-wrap th{position:sticky;top:0;background:#f7f9fa;z-index:1}
 .log-wrap td{font:12px/1.5 ui-monospace,Consolas,monospace;white-space:nowrap}
+/* UID 是长串：给个上限宽度 + 任意断点折行，完整显示又不把表格撑爆 */
+.log-wrap td.uid{max-width:180px;white-space:normal;word-break:break-all;line-height:1.4}
 .badge{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;border:1px solid var(--line);width:max-content;max-width:100%}
 .badge.bad{color:var(--bad);border-color:#e8c3d1;background:#fbe9ef}
 .badge.ok{color:var(--ok);border-color:#bfe0da;background:#e6f4f1}
@@ -1991,15 +2748,15 @@ ul{margin:6px 0 0;padding-left:18px}
   .actions{position:sticky;bottom:0;background:var(--bg);padding:8px 0 2px;display:grid;grid-template-columns:1fr 1fr;gap:8px;z-index:2}
   .actions button{margin:0!important;width:100%;white-space:normal;line-height:1.35;padding:9px 6px}
   .actions #saveBtn{grid-column:1/-1}
-  /* 按 ID 表格 → 一行一张卡，每个字段带小标签，输入框占满剩余宽度 */
-  #idsTable,#idsTable tbody{display:block}
-  #idsTable thead{display:none}
-  #idsTable tr{display:block;border:1px solid var(--line);border-radius:9px;padding:8px 10px 4px;margin-bottom:10px;background:#fbfcfd}
-  #idsTable td{display:grid;grid-template-columns:62px 1fr;gap:8px;align-items:center;border:0;padding:5px 0;font-size:13px;white-space:normal;min-width:0}
-  #idsTable td::before{content:attr(data-label);font-size:12px;color:var(--muted)}
-  #idsTable td:last-child{display:flex;justify-content:flex-end;gap:8px;padding:8px 0 4px;border-top:1px dashed var(--line);margin-top:4px}
-  #idsTable td:last-child::before{content:''}
-  #idsTable td input,#idsTable td select{width:100%;max-width:none;font-size:13px;padding:7px 9px}
+  /* 按 ID 表格 / 设备管理码表 → 一行一张卡，每个字段带小标签，输入框占满剩余宽度 */
+  #idsTable,#idsTable tbody,#codesTable,#codesTable tbody{display:block}
+  #idsTable thead,#codesTable thead{display:none}
+  #idsTable tr,#codesTable tr{display:block;border:1px solid var(--line);border-radius:9px;padding:8px 10px 4px;margin-bottom:10px;background:#fbfcfd}
+  #idsTable td,#codesTable td{display:grid;grid-template-columns:62px 1fr;gap:8px;align-items:center;border:0;padding:5px 0;font-size:13px;white-space:normal;min-width:0}
+  #idsTable td::before,#codesTable td::before{content:attr(data-label);font-size:12px;color:var(--muted)}
+  #idsTable td:last-child,#codesTable td:last-child{display:flex;justify-content:flex-end;gap:8px;padding:8px 0 4px;border-top:1px dashed var(--line);margin-top:4px}
+  #idsTable td:last-child::before,#codesTable td:last-child::before{content:''}
+  #idsTable td input,#idsTable td select,#codesTable td input,#codesTable td select{width:100%;max-width:none;font-size:13px;padding:7px 9px}
   /* 请求日志 → 紧凑的「字段:值」流式布局（一行一卡，但不逐个字段占一行） */
   .log-wrap{max-height:none;border:0;overflow:visible}
   #logTable,#logTable tbody{display:block}
@@ -2007,6 +2764,8 @@ ul{margin:6px 0 0;padding-left:18px}
   #logTable tr{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;border:1px solid var(--line);border-radius:9px;padding:7px 10px;margin-bottom:8px;background:#fbfcfd}
   #logTable td{display:inline-flex;gap:4px;border:0;padding:0;font-size:12px;white-space:normal;word-break:break-all;min-width:0}
   #logTable td::before{content:attr(data-label);font-size:11px;color:var(--muted);flex:none}
+  /* 手机上 UID 不设宽度上限，独占一行完整折行 */
+  #logTable td.uid{max-width:none;flex:1 1 100%;align-items:baseline}
 }
 </style>
 </head>
@@ -2023,10 +2782,11 @@ ul{margin:6px 0 0;padding-left:18px}
   </div>
 
   <div id="login" class="card" style="display:none">
-    <h2>登录</h2>
+    <h2>管理员登录</h2>
     <label>管理口令（ADMIN_TOKEN）</label>
     <input type="password" id="pass" placeholder="wrangler secret put ADMIN_TOKEN 时设置的那个">
     <div class="row" style="margin-top:12px"><button class="primary" id="loginBtn">登录</button></div>
+    <div class="hint">设备用户不走这里：入口是 <code>/owner</code>（设备 ID + 管理码登录，与管理员后台分开）。</div>
   </div>
 
   <div id="main" style="display:none">
@@ -2071,11 +2831,23 @@ ul{margin:6px 0 0;padding-left:18px}
 
     <div class="card">
       <h2>按 ID 配置（?id= 登记了才覆盖默认一套）</h2>
-      <table id="idsTable"><thead><tr>
-        <th style="width:26%">ID（≤32 位）</th><th style="width:12%">模式</th><th style="width:11%">固定币</th><th style="width:18%">主币种</th><th style="width:9%">条数</th><th style="width:16%">顺序</th><th style="width:72px"></th>
-      </tr></thead><tbody></tbody></table>
+      <div class="table-scroll"><table id="idsTable"><thead><tr>
+        <th style="width:20%">ID（≤32 位）</th><th style="width:9%">模式</th><th style="width:9%">固定币</th><th style="width:14%">主币种</th><th style="width:7%">条数</th><th style="width:13%">顺序</th><th style="width:10%">涨幅口径</th><th style="width:9%">时区</th><th style="width:72px"></th>
+      </tr></thead><tbody></tbody></table></div>
       <div class="row" style="margin-top:10px"><button id="addId">+ 添加 ID</button></div>
-      <div class="hint">留空的项 = 不覆盖；整行都空 = 只做登记（日志里不再标 unknown）</div>
+      <div class="hint">留空的项 = 不覆盖；整行都空 = 只做登记（日志里不再标 unknown）。涨幅口径单独设了就用这台的，没设跟随上面的全局口径；「时区」只在自然日口径下生效（8 / -5 / 5:30），留空 = 跟随全局时区。</div>
+    </div>
+
+    <div class="card">
+      <h2>设备管理码</h2>
+      <div class="row" style="margin-top:6px">
+        <select id="codePick" style="max-width:340px"></select>
+        <button id="codeGen">为选中 ID 生成管理码</button>
+      </div>
+      <div class="log-wrap">
+        <table id="codesTable"><thead><tr><th>ID</th><th>管理码</th><th>生成时间</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="hint">设备用户打开 <code>/owner</code>（与管理员后台分开的独立入口）输入 ID + 管理码，只能改自己那一行的独立配置（模式/固定币/主币种/条数/顺序/涨幅口径/时区），看不到全局配置和日志。下拉列表来自上面「按 ID 配置」里登记的 ID；重新生成会立刻作废旧码。</div>
     </div>
 
     <div class="card">
@@ -2175,6 +2947,7 @@ function idRow(one){
   const tr = document.createElement('tr');
   const opt = (list, cur) => list.map(b => '<option value="' + b + '"' + (b === cur ? ' selected' : '') + '>' + b + '</option>').join('');
   const sel = (cur) => '<option value=""></option><option value="scroll"' + (cur === 'scroll' ? ' selected' : '') + '>scroll</option><option value="fixed"' + (cur === 'fixed' ? ' selected' : '') + '>fixed</option>';
+  const chg = (cur) => '<option value=""></option><option value="24h"' + (cur === '24h' ? ' selected' : '') + '>24h</option><option value="tz"' + (cur === 'tz' ? ' selected' : '') + '>自然日</option>';
   const fx = one.fixed || '', cn = one.coin || '', od = one.order || '';
   tr.innerHTML =
     '<td data-label="ID"><input type="text" class="i-id" value="' + (one.__id || '') + '" maxlength="32" placeholder="TC…"></td>' +
@@ -2183,6 +2956,8 @@ function idRow(one){
     '<td data-label="主币种"><input type="text" class="i-coin" value="' + cn + '" placeholder="BTC,ETH"></td>' +
     '<td data-label="条数"><input type="number" class="i-topn num" min="0" max="11" value="' + (one.topN === undefined || one.topN === null ? '' : one.topN) + '"></td>' +
     '<td data-label="顺序"><input type="text" class="i-order" value="' + od + '" placeholder="留空=继承"></td>' +
+    '<td data-label="涨幅"><select class="i-chg">' + chg(one.change) + '</select></td>' +
+    '<td data-label="时区"><input type="text" class="i-tz" value="' + (one.tz || '') + '" placeholder="继承" title="自然日时区偏移：8 / -5 / 5:30，留空 = 跟随全局"></td>' +
     '<td style="white-space:nowrap"><button type="button" class="tiny pv">预览</button> <button type="button" class="tiny del">×</button></td>';
   tr.querySelector('.del').onclick = () => tr.remove();
   tr.querySelector('.pv').onclick = () => preview({ settings: collect(), id: tr.querySelector('.i-id').value });
@@ -2192,6 +2967,8 @@ function renderIds(ids){
   const tbody = $('idsTable').querySelector('tbody');
   tbody.innerHTML = '';
   Object.entries(ids || {}).forEach(([id, one]) => tbody.appendChild(idRow(Object.assign({}, one, { __id: id }))));
+  // 「设备管理码」下拉来自这里登记的 ID，登记变化后联动刷新
+  if (document.querySelector('#codesTable')) renderCodes();
 }
 function collectIds(){
   const ids = {};
@@ -2202,11 +2979,16 @@ function collectIds(){
     const mode = tr.querySelector('.i-mode').value, fx = tr.querySelector('.i-fixed').value;
     const cn = tr.querySelector('.i-coin').value.trim(), od = tr.querySelector('.i-order').value.trim();
     const tn = tr.querySelector('.i-topn').value.trim();
+    const chg = tr.querySelector('.i-chg') ? tr.querySelector('.i-chg').value : '';
+    const tzEl = tr.querySelector('.i-tz');
+    const tz = tzEl ? tzEl.value.trim() : '';
     if (mode) one.mode = mode;
     if (fx) one.fixed = fx;
     if (cn) one.coin = cn;
     if (od) one.order = od;
     if (tn !== '') one.topN = parseInt(tn, 10);
+    if (chg) one.change = chg;
+    if (tz) one.tz = tz;
     if (Object.keys(one).length) ids[id] = one;
   });
   return ids;
@@ -2255,6 +3037,7 @@ async function preview(body){
     const lines = [];
     lines.push('id=' + (j.id || '(默认一套)') + '  known=' + (j.known ? '已登记' : '未登记(走默认)'));
     lines.push('mode=' + j.config.mode + '  fixed=' + (j.config.fixed || '-') + '  topN=' + j.config.topN + '  coin=' + (j.config.coin || '-'));
+    lines.push('涨幅口径=' + (j.config.chg ? (j.config.chg === 'tz' ? '自然日' : '24h') : '跟随全局默认') + (j.config.chgTz ? '  时区=' + j.config.chgTz : ''));
     lines.push('order=' + j.config.order);
     lines.push('输出 ' + j.count + ' 条：' + j.coins.join(' → '));
     if (j.warnings && j.warnings.length) lines.push('⚠ ' + j.warnings.join('\\n⚠ '));
@@ -2289,7 +3072,10 @@ function renderLogs(j){
       '<td data-label="时间">' + fmtTime(r.t) + '</td>' +
       '<td data-label="类型">' + esc(r.y) + '</td>' +
       '<td data-label="ID">' + (r.i ? '<span class="badge ' + (r.k ? 'ok' : 'bad') + '">' + esc(r.i) + (r.k ? '' : ' !') + '</span>' : '—') + '</td>' +
-      '<td data-label="UID">' + (r.u ? esc(String(r.u).slice(0, 10)) + '…' : '—') + '</td>' +
+      // UID 完整显示（不再截断成 10 位），靠 .uid 的 break-all 折行自适应；
+      // 长按/悬停还能看 title 里的原值，方便复制排查
+      '<td data-label="UID" class="uid"' + (r.u ? ' title="' + esc(r.u) + '"' : '') + '>' +
+        (r.u ? esc(String(r.u)) : '—') + '</td>' +
       '<td data-label="IP">' + (esc(r.p) || '—') + (r.c ? ' <span class="hint">' + esc(r.c) + '</span>' : '') + '</td>' +
       '<td data-label="缓存">' + (esc(r.h) || '—') + '</td>' +
       '<td data-label="币种">' + (esc(r.n) || '—') + '</td>';
@@ -2328,8 +3114,80 @@ async function boot(){
     $('savedInfo').textContent = cfg.savedKeys.length ? ' · 已覆盖 ' + cfg.savedKeys.length + ' 项' : ' · 当前全部走 wrangler.toml 默认';
   }
   baseOptions($('fixed'), '（留空 = ORDER 第一项）');
+  await loadCodes();
   await loadLogs();
 }
+
+// —— 设备管理码（管理员）——
+let CODES = {};
+async function loadCodes(){
+  const j = await post('codes', null, 'GET');
+  CODES = j.ok ? (j.codes || {}) : {};
+  renderCodes();
+}
+function renderCodes(){
+  // 下拉：上面表格里已填的 ID ∪ 已有码的 ID
+  const pick = $('codePick');
+  const cur = pick.value;
+  const names = {};
+  document.querySelectorAll('#idsTable tbody tr .i-id').forEach(el => {
+    const v = el.value.trim().replace(/[^A-Za-z0-9]/g, '');
+    if (v) names[v] = 1;
+  });
+  Object.keys(CODES).forEach(k => { names[k] = 1; });
+  pick.innerHTML = '<option value="">— 选一个设备 ID —</option>' +
+    Object.keys(names).sort().map(id =>
+      '<option value="' + esc(id) + '">' + esc(id) + (CODES[id] ? '（已有码）' : '') + '</option>'
+    ).join('');
+  if (cur && names[cur]) pick.value = cur;
+
+  const tb = document.querySelector('#codesTable tbody');
+  const keys = Object.keys(CODES).sort();
+  if (!keys.length) {
+    tb.innerHTML = '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:10px">还没有生成过管理码</td></tr>';
+    return;
+  }
+  tb.innerHTML = '';
+  keys.forEach(id => {
+    const c = CODES[id] || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td data-label="ID">' + esc(id) + '</td>' +
+      '<td data-label="管理码"><b>' + esc(c.code || '') + '</b></td>' +
+      '<td data-label="生成时间">' + (c.t ? fmtTime(c.t) : '—') + '</td>' +
+      '<td data-label="操作"><button type="button" class="tiny cp">复制</button> <button type="button" class="tiny rg">重新生成</button> <button type="button" class="tiny dl">×</button></td>';
+    tr.querySelector('.cp').onclick = () => {
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(c.code || '');
+      msg('已复制：' + (c.code || ''), 'ok');
+    };
+    tr.querySelector('.rg').onclick = () => codeSet(id, 'auto');
+    tr.querySelector('.dl').onclick = async () => {
+      if (!confirm('删除 ' + id + ' 的管理码？对方将无法再登录。')) return;
+      codeSet(id, '');
+    };
+    tb.appendChild(tr);
+  });
+}
+async function codeSet(id, code){
+  const j = await post('codes/set', { id: id, code: code });
+  if (j.ok) {
+    if (code) {
+      CODES[id] = { code: j.code, t: Math.floor(Date.now() / 1000) };
+      msg('管理码已生成：' + j.code + '（把 ID 和码一起发给对方）', 'ok');
+    } else {
+      delete CODES[id];
+      msg(j.message || '已删除', 'ok');
+    }
+    renderCodes();
+  } else {
+    msg(j.message || '操作失败', 'bad');
+  }
+}
+$('codeGen').onclick = () => {
+  const id = $('codePick').value.trim();
+  if (!id) { msg('先从下拉里选一个设备 ID（来自「按 ID 配置」里登记的 ID）', 'bad'); return; }
+  codeSet(id, 'auto');
+};
 
 $('loginBtn').onclick = async () => {
   const j = await post('login', { token: $('pass').value });

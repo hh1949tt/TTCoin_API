@@ -299,6 +299,137 @@ function ttcoin_change_config()
     ];
 }
 
+/** 按固定偏移算出「当地自然日」：{tz, day, start}（start = 当地 00:00 的 UTC 秒）。 */
+function ttcoin_tz_clock(array $tz, $now = null)
+{
+    $now = $now === null ? time() : (int) $now;
+
+    return [
+        'tz'    => $tz,
+        'day'   => gmdate('Y-m-d', $now + $tz['offset']),
+        'start' => (int) floor(($now + $tz['offset']) / 86400) * 86400 - $tz['offset'],
+    ];
+}
+
+/**
+ * 本次需要抓日开盘价的时区列表（键 = 参数，值 = ttcoin_tz_clock()）。
+ *
+ * 谁会用到 tz 口径：
+ *   - 全局 TTCOIN_CHANGE_MODE = tz        → 全局时区
+ *   - 某个 id 的 change = tz              → 该 id 自己的 tz，没填就继承全局
+ *   - 全局已是 tz、某个 id 又单独填了 tz  → 也要算这个 id 的时区
+ * 一个都没有就返回空数组，一次 K 线都不抓。
+ */
+function ttcoin_change_tz_clocks()
+{
+    $global = ttcoin_change_config();
+    $clocks = [];
+
+    $add = function ($tz) use (&$clocks) {
+        if ($tz === null || isset($clocks[$tz['param']])) {
+            return;
+        }
+
+        $clocks[$tz['param']] = ttcoin_tz_clock($tz);
+    };
+
+    if ($global['mode'] === 'tz') {
+        $add($global['tz']);
+    }
+
+    $ids = json_decode((string) TTCOIN_FACE_IDS, true);
+
+    if (is_array($ids)) {
+        foreach ($ids as $one) {
+            if (!is_array($one)) {
+                continue;
+            }
+
+            $own  = strtolower(trim((string) ($one['change'] ?? '')));
+            $mode = ($own === 'tz' || $own === '24h') ? $own : $global['mode'];
+
+            if ($mode !== 'tz') {
+                continue;
+            }
+
+            $tz = isset($one['tz']) ? ttcoin_tz_parse($one['tz']) : null;
+
+            $add($tz !== null ? $tz : $global['tz']);
+        }
+    }
+
+    return $clocks;
+}
+
+/** TTCOIN_FACE_IDS 里是否有 id 把涨幅口径单独设成了 tz（决定抓不抓日开盘价）。 */
+function ttcoin_face_ids_need_tz()
+{
+    $ids = json_decode((string) TTCOIN_FACE_IDS, true);
+
+    if (!is_array($ids)) {
+        return false;
+    }
+
+    foreach ($ids as $one) {
+        if (is_array($one)
+            && isset($one['change'])
+            && strtolower(trim((string) $one['change'])) === 'tz') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * 出口涨幅口径挑选：tz 模式优先用缓存里的自然日涨幅（day 字段），
+ * 没有（旧缓存 / 当天开盘价没抓到）就保留 24h 值，绝不让 change 空着。
+ * 无论哪种口径都会把内部的 day / last 字段从出口剥掉，手表只认四件套。
+ *
+ * day 有两种形态：
+ *   {"8":"1.23","-5":"0.98"}  新缓存：按时区各算一份，按 $tzParam 取
+ *   "1.23"                    旧缓存：当时按全局时区算的，兜底直接用
+ *
+ * @param array $data 完整行情数组
+ * @param string $mode '24h' | 'tz'
+ * @param string $tzParam 生效的时区参数（normalizeTz/ttcoin_tz_parse 的 param）
+ * @return array
+ */
+function ttcoin_change_apply(array $data, $mode, $tzParam = '')
+{
+    $out = [];
+
+    foreach ($data as $item) {
+        if (!is_array($item)) {
+            $out[] = $item;
+            continue;
+        }
+
+        $raw = $item['day'] ?? null;
+        $day = null;
+
+        if (is_array($raw)) {
+            if ($tzParam !== '' && array_key_exists($tzParam, $raw)) {
+                $day = $raw[$tzParam];
+            } elseif ($tzParam === '' && count($raw) === 1) {
+                $day = reset($raw);          // 只有一个时区：直接用它
+            }
+        } elseif (is_string($raw) || is_int($raw) || is_float($raw)) {
+            $day = (string) $raw;            // 旧缓存（当时按全局时区算）
+        }
+
+        unset($item['day'], $item['last']);
+
+        if ($mode === 'tz' && $day !== null && $day !== '') {
+            $item['change'] = $day;
+        }
+
+        $out[] = $item;
+    }
+
+    return $out;
+}
+
 /** 涨幅百分比 → 与 24h 同款的可显示文本：最多 3 位小数、去尾零、-0 归 0。 */
 function ttcoin_change_text($pct)
 {
@@ -386,7 +517,9 @@ function ttcoin_face_id_known($id)
  * 最后统一清洗。所以不管默认还是按 id，清洗规则完全一致。
  *
  * @param string|null $id 行情配置 ID；null = 从 ?id= 里取
- * @return array{mode:string,order:array,fixed:string,topN:int,coin:string,id:string}
+ * @return array{mode:string,order:array,fixed:string,topN:int,coin:string,chg:string,chgTz:string,id:string}
+ *              chg 是该 id 的涨幅口径（'24h' / 'tz'，空 = 跟随全局默认）
+ *              chgTz 是自然日时区参数（空 = 跟随全局 CHANGE_TZ）
  */
 function ttcoin_face_config($id = null)
 {
@@ -413,6 +546,8 @@ function ttcoin_face_config($id = null)
         'fixed' => strtoupper(trim((string) TTCOIN_FACE_FIXED)),
         'topN'  => (int) TTCOIN_FACE_TOP_N,
         'coin'  => strtoupper(trim((string) TTCOIN_FACE_COIN)),
+        'chg'   => '',                        // 空 = 涨幅口径跟随全局默认
+        'chgTz' => '',                        // 空 = 自然日时区跟随全局默认
     ];
 
     // —— 按 id 覆盖：登记了哪个键就覆盖哪个键 ——
@@ -441,6 +576,14 @@ function ttcoin_face_config($id = null)
 
             if (array_key_exists('coin', $over)) {
                 $raw['coin'] = strtoupper(trim((string) $over['coin']));
+            }
+
+            if (array_key_exists('change', $over)) {
+                $raw['chg'] = strtolower(trim((string) $over['change']));
+            }
+
+            if (array_key_exists('tz', $over)) {
+                $raw['chgTz'] = trim((string) $over['tz']);
             }
         }
     }
@@ -511,12 +654,33 @@ function ttcoin_face_config($id = null)
         'fixed' => $fixed,
         'topN'  => $topN,
         'coin'  => $coin,
+        // 涨幅口径按 id 独立设置：'' = 跟随全局默认（TTCOIN_CHANGE_MODE）
+        'chg'   => ($raw['chg'] === 'tz' || $raw['chg'] === '24h') ? $raw['chg'] : '',
+        // 自然日时区：'' = 跟随全局（TTCOIN_CHANGE_TZ）；存归一化参数（"8" / "-5" / "5:30"）
+        'chgTz' => ($raw['chgTz'] !== '' && ttcoin_tz_parse($raw['chgTz']) !== null)
+            ? ttcoin_tz_parse($raw['chgTz'])['param']
+            : '',
         'id'    => $id,
     ];
 
     $cache[$id] = $config;
 
     return $config;
+}
+
+/**
+ * face 出口实际生效的涨幅配置：id 的 change / tz 优先，空 = 跟随全局。
+ *
+ * @param array $config ttcoin_face_config() 的返回值
+ * @return array{mode:string,tz:string}  tz 是时区参数（mode=24h 时置空）
+ */
+function ttcoin_face_change(array $config)
+{
+    $global = ttcoin_change_config();
+    $mode   = $config['chg'] !== '' ? $config['chg'] : $global['mode'];
+    $param  = ($config['chgTz'] ?? '') !== '' ? $config['chgTz'] : $global['tz']['param'];
+
+    return ['mode' => $mode, 'tz' => $mode === 'tz' ? $param : ''];
 }
 
 /**
@@ -1083,27 +1247,39 @@ function ttcoin_filter_output($json, $type)
             return $json;
         }
 
-        $shaped = ttcoin_encode(ttcoin_face_output($data, ttcoin_face_config()));
+        $config = ttcoin_face_config();
+
+        // 涨幅口径 + 时区：id 单独设了就用它，没设跟随全局默认
+        $eff  = ttcoin_face_change($config);
+        $data = ttcoin_change_apply($data, $eff['mode'], $eff['tz']);
+
+        $shaped = ttcoin_encode(ttcoin_face_output($data, $config));
 
         return $shaped === null ? $json : $shaped;
     }
 
-    // app / widget：登记的 id 配了 coin 时，把主币种排到最前。
-    // 没配 coin（默认）这里一个字节都不动，返回的还是原始 JSON。
-    $config = ttcoin_face_config();
+    // app / widget：登记的 id 配了 coin 时，把主币种排到最前；
+    // 全局涨幅口径是 tz 时还要换成自然日涨幅。两个都没配才原样返回。
+    $config  = ttcoin_face_config();
+    $chgCfg  = ttcoin_change_config();
+    $chgMode = $chgCfg['mode'];
 
-    if ($config['coin'] !== '') {
+    if ($config['coin'] !== '' || $chgMode === 'tz') {
         $data = json_decode($json, true);
 
         if (is_array($data) && !empty($data)) {
-            $moved = ttcoin_coin_first($data, $config['coin']);
+            if ($chgMode === 'tz') {
+                $data = ttcoin_change_apply($data, 'tz', $chgCfg['tz']['param']);
+            }
 
-            if ($moved !== $data) {
-                $shaped = ttcoin_encode($moved);
+            if ($config['coin'] !== '') {
+                $data = ttcoin_coin_first($data, $config['coin']);
+            }
 
-                if ($shaped !== null) {
-                    $json = $shaped;
-                }
+            $shaped = ttcoin_encode($data);
+
+            if ($shaped !== null) {
+                $json = $shaped;
             }
         }
     }
@@ -1527,14 +1703,18 @@ function ttcoin_fetch_day_opens($symbols, $cfg, $budget)
 /**
  * 带「按当地日期缓存」的日开盘价表。
  *
- * cache/dayopen.json = {day, tz, opens:{SYMBOL:价格}, missed:{SYMBOL:上次失败时间}}。
+ * cache/dayopen-<tz>.json = {day, tz, opens:{SYMBOL:价格}, missed:{SYMBOL:上次失败时间}}
+ * （每个时区一份：全局 -5 与某个 id 的 8 各算各的当地零点）。
  * 跨过当地 00:00 后 day 不匹配，整份作废重抓；抓不到的币记 missed，
  * 5 分钟内不重试，避免某个币上游缺数据时每 10 秒都白打一次。
  * 单文件 + flock 单飞，接口热路径上最多一次 file_get_contents。
  */
 function ttcoin_day_opens($symbols, $cfg, $budget = 4)
 {
-    $file = ttcoin_storage_path('cache', 'dayopen.json', 'coin_dayopen.json');
+    // 每个时区一份：-5 和 8 的「当地 00:00」不是同一个时刻，不能共用一份缓存
+    $param = isset($cfg['tz']['param']) ? (string) $cfg['tz']['param'] : '0';
+    $slug  = $param === '' ? '0' : (string) preg_replace('/[^0-9A-Za-z]/', '_', $param);
+    $file  = ttcoin_storage_path('cache', 'dayopen-' . $slug . '.json', 'coin_dayopen_' . $slug . '.json');
 
     $readState = function () use ($file, $cfg) {
         $raw = @file_get_contents($file);
@@ -1733,24 +1913,37 @@ function ttcoin_fetch($timeout = 10, $connectTimeout = 5)
     }
 
     // —— 涨幅口径 ——
-    // 24h（默认）：上面 priceChangePercent 原样用，一个字节都不动。
-    // tz：拿「指定时区当日 00:00」的开盘价重算。日开盘价按当地日期缓存，
-    // 一天最多抓一轮；某个币没抓到就保留它的 24h 值，绝不让整接口失败。
-    $changeCfg = ttcoin_change_config();
+    // 缓存里 change 永远是上游的滚动 24 小时值（不烘焙口径），需要 tz 口径的
+    // 时候另算一份自然日涨幅存进 day 字段；出口按「本次请求生效的口径」挑选。
+    // 这样全局口径和按 id 口径可以混用同一份缓存，互不覆盖。
+    // 什么时候要多算 day：全局口径是 tz，或者任何一个登记的 id 单独设了 tz。
+    // 每个用到的时区各算一份（通常是 1 个）：全局 + 各 id 自己设的 tz，
+    // 结果存成 day 映射 {"8":"1.23","-5":"0.98"}，出口按生效时区挑。
+    $clocks = ttcoin_change_tz_clocks();
 
-    if ($changeCfg['mode'] === 'tz') {
-        $opens = ttcoin_day_opens(array_keys($prices), $changeCfg, 4);
+    if (!empty($clocks)) {
+        $opensByTz = [];
+
+        foreach ($clocks as $param => $clock) {
+            $opensByTz[$param] = ttcoin_day_opens(array_keys($prices), $clock, 3);
+        }
 
         foreach ($prices as $symbol => $row) {
-            if (!isset($opens[$symbol])) {
-                continue;
+            $days = [];
+
+            foreach ($opensByTz as $param => $opens) {
+                if (!isset($opens[$symbol])) {
+                    continue;
+                }
+
+                $dayChange = ttcoin_day_change($row['last'], $opens[$symbol]);
+
+                if ($dayChange !== null) {
+                    $days[$param] = $dayChange;
+                }
             }
 
-            $dayChange = ttcoin_day_change($row['last'], $opens[$symbol]);
-
-            if ($dayChange !== null) {
-                $prices[$symbol]['change'] = $dayChange;
-            }
+            $prices[$symbol]['day'] = $days;   // 空数组 = 该币哪个时区都没抓到
         }
     }
 
@@ -1765,12 +1958,20 @@ function ttcoin_fetch($timeout = 10, $connectTimeout = 5)
         }
 
         // symbol 与 base 相同：表端显示什么就匹配什么，不再有倍数前缀。
-        $result[] = [
+        $entry = [
             'symbol' => $label,
             'base'   => $label,
             'price'  => $prices[$apiSymbol]['price'],
             'change' => $prices[$apiSymbol]['change'],
         ];
+
+        // 算过自然日涨幅就带上（可能是 null = 当天开盘价没抓到）；
+        // 没算过（全站没人用 tz 口径）就不带，缓存和出口保持精简。
+        if (array_key_exists('day', $prices[$apiSymbol])) {
+            $entry['day'] = $prices[$apiSymbol]['day'];
+        }
+
+        $result[] = $entry;
     }
 
     if (empty($result)) {

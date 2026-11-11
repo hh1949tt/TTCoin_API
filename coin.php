@@ -77,14 +77,25 @@ if ($coinNote !== '') {
 }
 
 // 涨幅口径回显：24h 是上游滚动 24 小时；tz 是以指定时区当日 00:00 开盘价
-// 为基准的自然日涨幅。curl -D - 一眼能看出本次（以及缓存里那份）用的哪套。
+// 为基准的自然日涨幅。face 出口按 id 单独设置优先，没设跟随全局；curl -D -
+// 一眼能看出本次（以及缓存里那份）用的哪套。
 $changeCfg = ttcoin_change_config();
+// face 出口：口径和时区都可能被该 id 单独覆盖（见 ttcoin_face_change）
+$effChg = ($type === 'face' && isset($faceConfig))
+    ? ttcoin_face_change($faceConfig)
+    : ['mode' => $changeCfg['mode'], 'tz' => $changeCfg['tz']['param']];
 
-header('X-TTCoin-Change-Mode: ' . $changeCfg['mode']);
+header('X-TTCoin-Change-Mode: ' . $effChg['mode']);
 
-if ($changeCfg['mode'] === 'tz') {
-    header('X-TTCoin-Change-Tz: ' . $changeCfg['tz']['label']);
-    header('X-TTCoin-Change-Day: ' . $changeCfg['day']);
+if ($effChg['mode'] === 'tz') {
+    $effTz = ttcoin_tz_parse($effChg['tz']);
+
+    if ($effTz === null) {
+        $effTz = $changeCfg['tz'];
+    }
+
+    header('X-TTCoin-Change-Tz: ' . $effTz['label']);
+    header('X-TTCoin-Change-Day: ' . gmdate('Y-m-d', time() + $effTz['offset']));
 }
 
 // 1) 新鲜缓存

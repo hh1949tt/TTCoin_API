@@ -15,7 +15,14 @@
  *   config.php            由本页生成的桥接文件，只做一件事：读 JSON 后 define
  *                         所以 coin.php 里那句 require config.php 完全不用改
  *   admin_pass.php        管理密码的 hash（直接访问不输出任何内容）
+ *   admin_keys.json       每个设备 ID 的管理码（设备用户登录用，管理员可生成/删除）
  *   config.php.bak.*      第一次接管旧 config.php 时自动备份
+ *
+ * 设备管理登录：管理员给某台设备的 ID 生成一个管理码，设备用户打开
+ * owner.php（独立入口，本页是管理员专用）用「ID + 管理码」登录，只能改自己
+ * 那个 ID 的独立配置（模式/固定币/主币种/条数/顺序/涨幅口径），看不到全局
+ * 配置、日志和其它设备。两套登录完全分开：本页不受理设备登录，
+ * owner.php 也不显示管理员登录。
  *
  * 为什么要多一层 JSON：直接让网页去改写 PHP 源码既容易写坏，也没法可靠地
  * 区分「用户手写的 define」和「后台托管的项」。JSON 做数据源、config.php 做
@@ -41,10 +48,11 @@
 ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
-define('ADMIN_VERSION', '1.0.0');
+define('ADMIN_VERSION', '1.1.0');
 define('ADMIN_DIR', __DIR__);
 define('ADMIN_PASS_FILE', ADMIN_DIR . '/admin_pass.php');
 define('ADMIN_SETTINGS_FILE', ADMIN_DIR . '/admin_settings.json');
+define('ADMIN_KEYS_FILE', ADMIN_DIR . '/admin_keys.json');
 define('ADMIN_CONFIG_FILE', ADMIN_DIR . '/config.php');
 define('ADMIN_MARK', 'ADMIN-GENERATED');
 
@@ -116,6 +124,52 @@ function admin_csrf_ok($token)
 function admin_logged_in()
 {
     return !empty($_SESSION['ok']);
+}
+
+function admin_owner_logged_in()
+{
+    return !empty($_SESSION['owner_id']);
+}
+
+// ---------------------------------------------------------------- 设备管理码
+
+/** 读设备管理码表：{ "TCxxxx": { "code": "AB2C4D5F", "time": 1699... } }。 */
+function admin_load_keys()
+{
+    $raw = json_decode((string) @file_get_contents(ADMIN_KEYS_FILE), true);
+
+    return is_array($raw) ? $raw : [];
+}
+
+/** 原子写设备管理码表。 */
+function admin_save_keys($keys)
+{
+    $json = json_encode($keys, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+
+    if (!is_string($json)) {
+        return false;
+    }
+
+    $tmp = ADMIN_KEYS_FILE . '.tmp';
+
+    if (@file_put_contents($tmp, $json . "\n", LOCK_EX) === false) {
+        return false;
+    }
+
+    return @rename($tmp, ADMIN_KEYS_FILE);
+}
+
+/** 生成 8 位无歧义字符（去掉 0/O/1/I/L）的随机管理码。 */
+function admin_gen_code()
+{
+    $alphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+    $code = '';
+
+    for ($i = 0; $i < 8; $i++) {
+        $code .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+    }
+
+    return $code;
 }
 
 function admin_pass_hash()
@@ -327,6 +381,90 @@ function admin_clean_list($raw, $pool)
 }
 
 /**
+ * 校验单个 ID 的覆盖项（mode / fixed / topN / coin / order / change）。
+ * 只收「非空且合法」的键，空 = 不覆盖 = 继承默认。
+ * 返回 [one, errors]。管理员保存和设备用户保存共用这一套规则。
+ */
+function admin_clean_id_over($over, $pool, $id)
+{
+    $errors = [];
+    $one = [];
+
+    if (isset($over['mode']) && $over['mode'] !== '') {
+        $m = strtolower(trim((string) $over['mode']));
+
+        if (in_array($m, ['scroll', 'fixed'], true)) {
+            $one['mode'] = $m;
+        } else {
+            $errors[] = 'ID ' . $id . ' 的模式非法';
+        }
+    }
+
+    if (isset($over['change']) && $over['change'] !== '') {
+        $chg = strtolower(trim((string) $over['change']));
+
+        if (in_array($chg, ['24h', 'tz'], true)) {
+            $one['change'] = $chg;
+        } else {
+            $errors[] = 'ID ' . $id . ' 的涨幅口径只能是 24h 或 tz';
+        }
+    }
+
+    // 该 id 的自然日时区（只在 change=tz 或全局 tz 时生效）；空 = 继承全局
+    if (isset($over['tz']) && trim((string) $over['tz']) !== '') {
+        $tz = ttcoin_tz_parse($over['tz']);
+
+        if ($tz === null) {
+            $errors[] = 'ID ' . $id . ' 的涨幅时区写得不对（示例：8 / -5 / 5:30）';
+        } else {
+            $one['tz'] = $tz['param'];
+        }
+    }
+
+    if (isset($over['fixed']) && $over['fixed'] !== '') {
+        $f = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) $over['fixed']));
+
+        if (in_array($f, $pool, true)) {
+            $one['fixed'] = $f;
+        } else {
+            $errors[] = 'ID ' . $id . ' 的固定币种不在候选池里';
+        }
+    }
+
+    if (isset($over['topN']) && $over['topN'] !== '') {
+        $n = (int) $over['topN'];
+
+        if ($n >= 0 && $n <= 50) {
+            $one['topN'] = $n;
+        } else {
+            $errors[] = 'ID ' . $id . ' 的条数要在 0 到 50 之间';
+        }
+    }
+
+    if (isset($over['coin']) && $over['coin'] !== '') {
+        $c = admin_clean_list($over['coin'], $pool);
+
+        if ($c === '') {
+            $errors[] = 'ID ' . $id . ' 的主币种都不在候选池里';
+        } else {
+            $one['coin'] = $c;
+        }
+    }
+
+    if (isset($over['order']) && $over['order'] !== '') {
+        $o = admin_clean_list($over['order'], $pool);
+
+        if ($o === '') {
+            $errors[] = 'ID ' . $id . ' 的顺序都不在候选池里';
+        } else {
+            $one['order'] = $o;
+        }
+    }
+
+    return [$one, $errors];
+}
+
+/**
  * 规范化提交上来的配置。返回 [clean, errors]。
  * 宁可报错让人改，也不悄悄写进一个非法值 —— 非法值在 lib 里多半是静默回落，
  * 表现为「设置没生效」，比报错更难查。
@@ -396,56 +534,8 @@ function admin_validate($input, $pool)
             }
 
             $one = [];
-
-            if (isset($over['mode']) && $over['mode'] !== '') {
-                $m = strtolower(trim((string) $over['mode']));
-
-                if (in_array($m, ['scroll', 'fixed'], true)) {
-                    $one['mode'] = $m;
-                } else {
-                    $errors[] = 'ID ' . $id . ' 的模式非法';
-                }
-            }
-
-            if (isset($over['fixed']) && $over['fixed'] !== '') {
-                $f = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) $over['fixed']));
-
-                if (in_array($f, $pool, true)) {
-                    $one['fixed'] = $f;
-                } else {
-                    $errors[] = 'ID ' . $id . ' 的固定币种不在候选池里';
-                }
-            }
-
-            if (isset($over['topN']) && $over['topN'] !== '') {
-                $n = (int) $over['topN'];
-
-                if ($n >= 0 && $n <= 50) {
-                    $one['topN'] = $n;
-                } else {
-                    $errors[] = 'ID ' . $id . ' 的条数要在 0 到 50 之间';
-                }
-            }
-
-            if (isset($over['coin']) && $over['coin'] !== '') {
-                $c = admin_clean_list($over['coin'], $pool);
-
-                if ($c === '') {
-                    $errors[] = 'ID ' . $id . ' 的主币种都不在候选池里';
-                } else {
-                    $one['coin'] = $c;
-                }
-            }
-
-            if (isset($over['order']) && $over['order'] !== '') {
-                $o = admin_clean_list($over['order'], $pool);
-
-                if ($o === '') {
-                    $errors[] = 'ID ' . $id . ' 的顺序都不在候选池里';
-                } else {
-                    $one['order'] = $o;
-                }
-            }
+            list($one, $oneErrors) = admin_clean_id_over($over, $pool, $id);
+            $errors = array_merge($errors, $oneErrors);
 
             $ids[$id] = $one;
 
@@ -626,7 +716,7 @@ function admin_tail_lines($file, $lines)
 $action = isset($_GET['action']) ? (string) $_GET['action'] : '';
 $body   = null;
 
-if ($action !== '' && in_array($action, ['login', 'setpass', 'save', 'preview', 'log', 'logout'], true)) {
+if ($action !== '' && in_array($action, ['login', 'setpass', 'owner_login', 'owner_logout', 'code_set', 'save', 'owner_save', 'preview', 'owner_preview', 'log', 'logout'], true)) {
     $body = admin_body();
 }
 
@@ -706,11 +796,54 @@ if ($action === 'logout') {
     exit;
 }
 
-// ---------------------------------------------------------------- 预览
-// 必须在 require lib.php **之前**：先把候选值 define 出来，lib 的
-// ttcoin_face_define() 看到已定义就跳过，于是拿到的就是「保存后会生效」的结果。
-// 这样预览与线上走的是同一份解析代码，不存在两套逻辑跑偏的问题。
-if ($action === 'preview') {
+// —— 设备管理登录：ID + 管理码。会话只记 owner_id，权限单独判 ——
+// 只能从 owner.php（设备用户入口）发起；管理员入口不受理，登录彻底分开。
+if ($action === 'owner_login') {
+    if (!defined('ADMIN_OWNER_ENTRY')) {
+        json_out(['ok' => false, 'message' => '设备用户请从 owner.php 登录'], 403);
+    }
+
+    if (!admin_csrf_ok(isset($body['_csrf']) ? $body['_csrf'] : '')) {
+        json_out(['ok' => false, 'message' => '页面已过期，刷新后重试'], 419);
+    }
+
+    $now = time();
+
+    if (!empty($_SESSION['owner_lock_until']) && $_SESSION['owner_lock_until'] > $now) {
+        json_out(['ok' => false, 'message' => '尝试次数过多，请 ' . ceil(($_SESSION['owner_lock_until'] - $now) / 60) . ' 分钟后再试'], 429);
+    }
+
+    $id   = admin_clean_id(isset($body['id']) ? $body['id'] : '');
+    $code = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) (isset($body['code']) ? $body['code'] : '')));
+    $keys = admin_load_keys();
+    $got  = isset($keys[$id]['code']) ? (string) $keys[$id]['code'] : '';
+
+    // 不区分「ID 不存在」和「码不对」，不给试探的人反馈哪一步错了
+    if ($id === '' || $got === '' || !hash_equals($got, $code)) {
+        $_SESSION['owner_fails'] = (int) (isset($_SESSION['owner_fails']) ? $_SESSION['owner_fails'] : 0) + 1;
+
+        if ($_SESSION['owner_fails'] >= 5) {
+            $_SESSION['owner_fails'] = 0;
+            $_SESSION['owner_lock_until'] = $now + 300;
+        }
+
+        json_out(['ok' => false, 'message' => 'ID 或管理码不对'], 401);
+    }
+
+    $_SESSION['owner_id'] = $id;
+    unset($_SESSION['owner_fails'], $_SESSION['owner_lock_until']);
+    json_out(['ok' => true]);
+}
+
+// —— 设备用户退出：只清 owner 会话，不动管理员登录态 ——
+if ($action === 'owner_logout') {
+    unset($_SESSION['owner_id'], $_SESSION['owner_fails'], $_SESSION['owner_lock_until']);
+    header('Location: owner.php');
+    exit;
+}
+
+// —— 管理员维护设备管理码：code=auto 生成，code=空串 删除 ——
+if ($action === 'code_set') {
     if (!admin_logged_in()) {
         json_out(['ok' => false, 'message' => '未登录'], 401);
     }
@@ -719,7 +852,125 @@ if ($action === 'preview') {
         json_out(['ok' => false, 'message' => '页面已过期，刷新后重试'], 419);
     }
 
-    $candidate = isset($body['settings']) && is_array($body['settings']) ? $body['settings'] : [];
+    $id   = admin_clean_id(isset($body['id']) ? $body['id'] : '');
+    $code = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) (isset($body['code']) ? $body['code'] : '')));
+
+    if ($id === '') {
+        json_out(['ok' => false, 'message' => 'ID 不能为空'], 422);
+    }
+
+    $keys = admin_load_keys();
+
+    if ($code === '') {
+        unset($keys[$id]);
+
+        if (!admin_save_keys($keys)) {
+            json_out(['ok' => false, 'message' => '写不进 admin_keys.json，检查目录权限'], 500);
+        }
+
+        json_out(['ok' => true, 'message' => '已删除 ' . $id . ' 的管理码']);
+    }
+
+    if ($code === 'AUTO') {
+        $code = admin_gen_code();
+    } elseif (strlen($code) < 6 || strlen($code) > 32) {
+        json_out(['ok' => false, 'message' => '管理码长度要在 6 到 32 位之间（auto = 自动生成）'], 422);
+    }
+
+    $keys[$id] = ['code' => $code, 'time' => time()];
+
+    if (!admin_save_keys($keys)) {
+        json_out(['ok' => false, 'message' => '写不进 admin_keys.json，检查目录权限'], 500);
+    }
+
+    json_out(['ok' => true, 'message' => '已保存', 'code' => $code, 'time' => date('Y-m-d H:i', (int) $keys[$id]['time'])]);
+}
+
+/**
+ * 设备用户预览用轻清洗：只保证结构合法（完整校验在保存时由
+ * admin_clean_id_over 做）。非法值交给 lib 的解析器静默回落，预览本来就是
+ * 试算，没必要为了它再复制一份候选池校验。
+ */
+function admin_light_clean_over($over)
+{
+    $one = [];
+    $mode = strtolower(trim((string) (isset($over['mode']) ? $over['mode'] : '')));
+
+    if (in_array($mode, ['scroll', 'fixed'], true)) {
+        $one['mode'] = $mode;
+    }
+
+    $fixed = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) (isset($over['fixed']) ? $over['fixed'] : '')));
+
+    if ($fixed !== '') {
+        $one['fixed'] = substr($fixed, 0, 12);
+    }
+
+    if (isset($over['topN']) && $over['topN'] !== '') {
+        $one['topN'] = max(0, min(50, (int) $over['topN']));
+    }
+
+    $chg = strtolower(trim((string) (isset($over['change']) ? $over['change'] : '')));
+
+    if (in_array($chg, ['24h', 'tz'], true)) {
+        $one['change'] = $chg;
+    }
+
+    // 这里只做「原样带上、限长」：本函数运行在 require lib.php 之前，
+    // 不能调 ttcoin_tz_parse()；真正归一化交给 lib 的 ttcoin_face_config()
+    $tz = trim((string) (isset($over['tz']) ? $over['tz'] : ''));
+
+    if ($tz !== '') {
+        $one['tz'] = substr($tz, 0, 8);
+    }
+
+    foreach (['coin', 'order'] as $key) {
+        $list = strtoupper(preg_replace('/[^A-Za-z0-9,]/', '', (string) (isset($over[$key]) ? $over[$key] : '')));
+
+        if ($list !== '') {
+            $one[$key] = $list;
+        }
+    }
+
+    return $one;
+}
+
+// ---------------------------------------------------------------- 预览
+// 必须在 require lib.php **之前**：先把候选值 define 出来，lib 的
+// ttcoin_face_define() 看到已定义就跳过，于是拿到的就是「保存后会生效」的结果。
+// 这样预览与线上走的是同一份解析代码，不存在两套逻辑跑偏的问题。
+// 设备用户也走这个入口：候选 = 当前已保存配置 + 只覆盖自己那一行。
+if ($action === 'preview') {
+    $ownerMode = admin_owner_logged_in() && !admin_logged_in();
+
+    if (!admin_csrf_ok(isset($body['_csrf']) ? $body['_csrf'] : '')) {
+        json_out(['ok' => false, 'message' => '页面已过期，刷新后重试'], 419);
+    }
+
+    if ($ownerMode) {
+        $settings = admin_load_settings();
+        $ids      = is_array($settings['TTCOIN_FACE_IDS']) ? $settings['TTCOIN_FACE_IDS'] : [];
+        $over     = isset($body['over']) && is_array($body['over']) ? $body['over'] : [];
+
+        // 预览 = 已保存配置 + 本次覆盖合并（本次没填的项保留已保存值），
+        // 否则保存过的涨幅口径之类会被预览悄悄丢掉，显示结果和保存后不一致
+        $savedOne = isset($ids[$_SESSION['owner_id']]) && is_array($ids[$_SESSION['owner_id']])
+            ? $ids[$_SESSION['owner_id']]
+            : [];
+
+        $ids[$_SESSION['owner_id']] = array_merge($savedOne, admin_light_clean_over($over));
+        $settings['TTCOIN_FACE_IDS'] = $ids;
+
+        $candidate = $settings;
+        $id        = $_SESSION['owner_id'];
+    } else {
+        if (!admin_logged_in()) {
+            json_out(['ok' => false, 'message' => '未登录'], 401);
+        }
+
+        $candidate = isset($body['settings']) && is_array($body['settings']) ? $body['settings'] : [];
+        $id        = admin_clean_id(isset($body['id']) ? $body['id'] : '');
+    }
 
     if (isset($candidate['TTCOIN_FACE_IDS']) && is_array($candidate['TTCOIN_FACE_IDS'])) {
         $candidate['TTCOIN_FACE_IDS'] = json_encode(
@@ -750,7 +1001,6 @@ if ($action === 'preview') {
 
     require ADMIN_DIR . '/lib.php';
 
-    $id  = admin_clean_id(isset($body['id']) ? $body['id'] : '');
     $cfg = ttcoin_face_config($id);
 
     // 模拟输出：优先用真实缓存（就是手表此刻会拿到的行情），没缓存就用假数据
@@ -778,6 +1028,10 @@ if ($action === 'preview') {
     $dir    = rtrim(str_replace('\\', '/', dirname(isset($_SERVER['SCRIPT_NAME']) ? $_SERVER['SCRIPT_NAME'] : '/')), '/');
     $host   = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost';
 
+    // 实际生效的涨幅口径（含 id 自己的时区），预览里一并回显
+    $effChg  = ttcoin_face_change($cfg);
+    $effTz   = ttcoin_tz_parse($effChg['tz']);
+
     json_out([
         'ok'     => true,
         'id'     => $id,
@@ -787,6 +1041,9 @@ if ($action === 'preview') {
             'fixed' => $cfg['fixed'],
             'topN'  => $cfg['topN'],
             'coin'  => $cfg['coin'],
+            'chg'   => isset($cfg['chg']) ? $cfg['chg'] : '',
+            'chgTz' => isset($cfg['chgTz']) ? $cfg['chgTz'] : '',
+            'chgTzLabel' => ($effChg['mode'] === 'tz' && $effTz !== null) ? $effTz['label'] : '',
             'order' => implode(',', $cfg['order']),
         ],
         'count'  => count($out),
@@ -840,6 +1097,78 @@ if ($action === 'save') {
         'ok'       => true,
         'message'  => $configOk ? '已保存，配置已生效' : '设置已保存，但 config.php 写入失败（检查目录权限）',
         'config'   => $configOk,
+        'time'     => date('Y-m-d H:i:s'),
+        'warnings' => $warnings,
+    ]);
+}
+
+// —— 设备用户保存：只允许改自己那一行，且只动 FACE_IDS，别的键一概不碰 ——
+if ($action === 'owner_save') {
+    if (!admin_owner_logged_in()) {
+        json_out(['ok' => false, 'message' => '未登录'], 401);
+    }
+
+    if (!defined('ADMIN_OWNER_ENTRY')) {
+        json_out(['ok' => false, 'message' => '设备用户请从 owner.php 登录'], 403);
+    }
+
+    if (!admin_csrf_ok(isset($body['_csrf']) ? $body['_csrf'] : '')) {
+        json_out(['ok' => false, 'message' => '页面已过期，刷新后重试'], 419);
+    }
+
+    $id   = (string) $_SESSION['owner_id'];
+    $over = isset($body['over']) && is_array($body['over']) ? $body['over'] : [];
+
+    list($one, $errors) = admin_clean_id_over($over, $pool, $id);
+
+    if (!empty($errors)) {
+        json_out(['ok' => false, 'message' => '有 ' . count($errors) . ' 项需要修正', 'errors' => $errors], 422);
+    }
+
+    // 与 worker 端同一策略：读原始 JSON，只改 FACE_IDS 自己那行，其余键原样保留
+    // （不能拿 admin_load_settings() 的合并结果整体写回 —— 那会把没保存过的
+    // 默认值固化进 JSON，以后 lib 升级改默认也改不动了）
+    $raw = json_decode((string) @file_get_contents(ADMIN_SETTINGS_FILE), true);
+
+    if (!is_array($raw)) {
+        $raw = [];
+    }
+
+    $ids = isset($raw['TTCOIN_FACE_IDS']) && is_array($raw['TTCOIN_FACE_IDS']) ? $raw['TTCOIN_FACE_IDS'] : [];
+    $ids[$id] = $one;
+    $raw['TTCOIN_FACE_IDS'] = $ids;
+
+    if (!admin_save_settings($raw)) {
+        json_out(['ok' => false, 'message' => '写不进 admin_settings.json，检查目录权限'], 500);
+    }
+
+    $configOk = admin_write_config();
+
+    // 与 admin_validate 同一条软提醒：coin 优先于 fixed
+    $warnings = [];
+
+    if (isset($one['fixed']) && $one['fixed'] !== '') {
+        $merged = admin_load_settings();
+        $globalCoin = (string) (isset($merged['TTCOIN_FACE_COIN']) ? $merged['TTCOIN_FACE_COIN'] : '');
+
+        if ($globalCoin !== '') {
+            $first = explode(',', $globalCoin);
+            $first = $first[0];
+            $own = isset($one['coin']) ? explode(',', $one['coin']) : [];
+            $ownFirst = !empty($own) ? $own[0] : '';
+
+            if ($ownFirst === '' && $first !== $one['fixed']) {
+                $warnings[] = '全局主币种是 ' . $first . '（coin 优先，会覆盖固定币）；'
+                    . '要固定 ' . $one['fixed'] . '，请把主币种也填成 ' . $one['fixed'];
+            } elseif ($ownFirst !== '' && $ownFirst !== $one['fixed']) {
+                $warnings[] = '固定币是 ' . $one['fixed'] . '，但主币种第一项是 ' . $ownFirst . '，实际会显示 ' . $ownFirst;
+            }
+        }
+    }
+
+    json_out([
+        'ok'       => true,
+        'message'  => $configOk ? '已保存，配置已生效' : '已保存，但 config.php 写入失败（请联系管理员）',
         'time'     => date('Y-m-d H:i:s'),
         'warnings' => $warnings,
     ]);
@@ -912,6 +1241,283 @@ $coinList  = array_values(array_filter(explode(',', (string) $settings['TTCOIN_F
 $idsMap    = is_array($settings['TTCOIN_FACE_IDS']) ? $settings['TTCOIN_FACE_IDS'] : [];
 
 ?>
+<?php
+// ===========================================================================
+// 设备用户页面（ID + 管理码登录）：只能改自己那一行的独立配置。
+// 只从 owner.php（设备用户入口）渲染；管理员后台 admin.php 不掺和这两套页面，
+// 管理员登录和设备用户登录彻底分开。
+// ===========================================================================
+$ownerId = admin_owner_logged_in() ? $_SESSION['owner_id'] : null;
+
+if (defined('ADMIN_OWNER_ENTRY') && $ownerId !== null):
+    // 前面主流程已 require 过 config/lib，这里用 require_once 防重复声明
+    if (is_file(ADMIN_CONFIG_FILE)) {
+        require_once ADMIN_CONFIG_FILE;
+    }
+
+    require_once ADMIN_DIR . '/lib.php';
+
+    $pool     = array_values(ttcoin_symbols());
+    $all      = admin_load_settings();
+    $idsMapO  = is_array($all['TTCOIN_FACE_IDS']) ? $all['TTCOIN_FACE_IDS'] : [];
+    $mine     = isset($idsMapO[$ownerId]) && is_array($idsMapO[$ownerId]) ? $idsMapO[$ownerId] : [];
+    $csrfO    = admin_csrf();
+?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTCoin 设备配置</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#e3e8ee;--text:#1f2937;--muted:#6b7280;
+  --accent:#0f766e;--accent-soft:#e8f4f2;--mono:ui-monospace,SFMono-Regular,Consolas,"Courier New",monospace}
+*{box-sizing:border-box}
+html,body{max-width:100%;overflow-x:hidden}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:640px;margin:0 auto;padding:24px 16px 40px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:18px 16px;margin-bottom:14px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:12.5px;margin:0 0 16px}
+.sub .mono{font-family:var(--mono)}
+label{display:block;font-size:12.5px;color:#374151;font-weight:550;margin:12px 0 5px}
+input[type=text],input[type=number],select{width:100%;padding:8px 10px;border:1px solid #d5dbe3;
+  border-radius:7px;background:#fff;font:inherit;font-size:14px;color:var(--text);outline:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(15,118,110,.12)}
+.tip{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.45}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:9px 16px;
+  border-radius:8px;border:1px solid #d5dbe3;background:#fff;color:#374151;font:inherit;
+  font-size:13.5px;cursor:pointer}
+.btn:disabled{opacity:.55;cursor:default}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:550}
+.note{border-radius:8px;padding:10px 12px;font-size:12.5px;line-height:1.55;margin:12px 0 0;display:none}
+.note.warn{background:#fff8e1;border:1px solid #f0e0b8;color:#6b4e00;display:block}
+.note.err{background:#fdecea;border:1px solid #f5c9c4;color:#8c1d18;display:block}
+.note.ok{background:var(--accent-soft);border:1px solid #b9ddd7;color:#0b5f59;display:block}
+#pvOut{display:none;background:#10222b;color:#d8e6ee;border-radius:8px;padding:10px 12px;
+  font:12.5px/1.7 var(--mono);white-space:pre-wrap;word-break:break-all;margin-top:12px}
+@media (max-width:480px){.wrap{padding:16px 10px 32px}.card{padding:15px 12px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>我的行情配置</h1>
+  <p class="sub">设备 ID <span class="mono"><?php echo h($ownerId); ?></span> ·
+    <a href="owner.php?action=owner_logout">退出</a></p>
+
+  <div class="card">
+    <label>模式</label>
+    <select id="mode">
+      <option value="">跟随默认</option>
+      <option value="scroll"<?php echo (isset($mine['mode']) && $mine['mode'] === 'scroll') ? ' selected' : ''; ?>>scroll 滚屏</option>
+      <option value="fixed"<?php echo (isset($mine['mode']) && $mine['mode'] === 'fixed') ? ' selected' : ''; ?>>fixed 固定</option>
+    </select>
+    <div class="tip">scroll：按顺序逐条轮播；fixed：只显示一个币。</div>
+
+    <label>固定币（fixed 模式生效）</label>
+    <select id="fixed">
+      <option value="">跟随默认</option>
+      <?php foreach ($pool as $coin): ?>
+        <option value="<?php echo h($coin); ?>"<?php echo (isset($mine['fixed']) && $mine['fixed'] === $coin) ? ' selected' : ''; ?>><?php echo h($coin); ?></option>
+      <?php endforeach; ?>
+    </select>
+
+    <label>主币种（排最前，可多个，逗号分隔）</label>
+    <input type="text" id="coin" placeholder="留空 = 继承默认" value="<?php echo h(isset($mine['coin']) ? $mine['coin'] : ''); ?>">
+
+    <label>条数上限（scroll 模式）</label>
+    <input type="number" id="topn" min="0" max="50" placeholder="留空 = 继承默认"
+      value="<?php echo isset($mine['topN']) ? (int) $mine['topN'] : ''; ?>">
+
+    <label>顺序（可选，逗号分隔币种）</label>
+    <input type="text" id="order" placeholder="留空 = 继承默认顺序" value="<?php echo h(isset($mine['order']) ? $mine['order'] : ''); ?>">
+
+    <label>涨幅口径</label>
+    <select id="chg">
+      <option value="">跟随默认</option>
+      <option value="24h"<?php echo (isset($mine['change']) && $mine['change'] === '24h') ? ' selected' : ''; ?>>24 小时滚动</option>
+      <option value="tz"<?php echo (isset($mine['change']) && $mine['change'] === 'tz') ? ' selected' : ''; ?>>自然日（按时区）</option>
+    </select>
+    <label>自然日时区偏移</label>
+    <input type="text" id="otz" placeholder="留空 = 跟随默认（8 / -5 / 5:30）" value="<?php echo h(isset($mine['tz']) ? $mine['tz'] : ''); ?>">
+    <div class="tip">自然日：以「该时区当日 00:00」开盘价为基准重算涨幅；时区只在这台选自然日（或全局默认就是自然日）时生效。</div>
+
+    <div class="tip">留空的项 = 继承管理员的全局默认。注意主币种（coin）优先于固定币（fixed）。</div>
+
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="btn primary" style="flex:1" id="saveBtn">保存并生效</button>
+      <button class="btn" style="flex:1" id="pvBtn">预览</button>
+    </div>
+    <div class="note" id="note"></div>
+    <div id="pvOut"></div>
+  </div>
+</div>
+<script>
+const CSRF = <?php echo json_encode($csrfO); ?>;
+function $(id){ return document.getElementById(id); }
+function note(msg, cls){
+  const el = $('note');
+  el.textContent = msg || '';
+  el.className = 'note' + (cls ? ' ' + cls : '');
+}
+async function post(action, payload){
+  const res = await fetch(location.pathname + '?action=' + action, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(Object.assign({_csrf: CSRF}, payload || {}))
+  });
+  return res.json();
+}
+function collect(){
+  const over = {};
+  const mode = $('mode').value;
+  if(mode) over.mode = mode;
+  const fx = $('fixed').value;
+  if(fx) over.fixed = fx;
+  const coin = $('coin').value.trim();
+  if(coin) over.coin = coin;
+  const tn = $('topn').value.trim();
+  if(tn !== '') over.topN = parseInt(tn, 10);
+  const od = $('order').value.trim();
+  if(od) over.order = od;
+  const chg = $('chg').value;
+  if(chg) over.change = chg;
+  const otz = $('otz').value.trim();
+  if(otz) over.tz = otz;
+  return over;
+}
+$('saveBtn').onclick = async function(){
+  const btn = $('saveBtn');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try{
+    const r = await post('owner_save', {over: collect()});
+    if(r.ok){
+      note('已保存 ' + (r.time || '') + ((r.warnings || []).length ? '  ⚠ ' + r.warnings.join('；') : ''), (r.warnings || []).length ? 'warn' : 'ok');
+    }else{
+      note((r.errors && r.errors.length ? r.errors.join('；') : r.message) || '保存失败', 'err');
+    }
+  }catch(e){
+    note('请求失败：' + e.message, 'err');
+  }
+  btn.disabled = false;
+  btn.textContent = '保存并生效';
+};
+$('pvBtn').onclick = async function(){
+  const out = $('pvOut');
+  out.style.display = 'block';
+  out.textContent = '计算中…';
+  try{
+    const r = await post('preview', {over: collect()});
+    if(!r.ok){ out.textContent = r.message || '预览失败'; return; }
+    const lines = [];
+    lines.push('生效模式：' + r.config.mode + (r.config.mode === 'fixed' ? '（只回一条）' : ''));
+    lines.push('固定币：' + (r.config.fixed || '—'));
+    lines.push('条数上限：' + (r.config.topN === 0 ? '不限' : r.config.topN));
+    lines.push('主币种：' + (r.config.coin || '—（不重排）'));
+    lines.push('涨幅口径：' + (r.config.chg ? (r.config.chg === 'tz' ? '自然日' : '24 小时滚动') : '跟随全局默认') +
+      (r.config.chgTzLabel ? '  时区=' + r.config.chgTzLabel : ''));
+    lines.push('最终顺序：' + r.config.order);
+    lines.push('表盘会收到 ' + r.count + ' 条：' + r.coins.join(' → '));
+    out.textContent = lines.join('\n');
+  }catch(e){
+    out.textContent = '请求失败：' + e.message;
+  }
+};
+</script>
+</body>
+</html>
+<?php exit; endif; ?>
+
+<?php if (defined('ADMIN_OWNER_ENTRY') && $ownerId === null): ?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTCoin 设备管理登录</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#e3e8ee;--text:#1f2937;--muted:#6b7280;
+  --accent:#0f766e;--accent-soft:#e8f4f2;--mono:ui-monospace,SFMono-Regular,Consolas,"Courier New",monospace}
+*{box-sizing:border-box}
+html,body{max-width:100%;overflow-x:hidden}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+.auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.auth-card{width:100%;max-width:380px;background:var(--card);border:1px solid var(--line);
+  border-radius:14px;padding:28px 26px;box-shadow:0 1px 3px rgba(16,24,40,.06)}
+h1{font-size:19px;margin:0 0 6px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 20px}
+label{display:block;font-size:12.5px;color:#374151;margin-bottom:5px;font-weight:550}
+input[type=text]{width:100%;padding:8px 10px;border:1px solid #d5dbe3;border-radius:7px;
+  background:#fff;font:inherit;font-size:14px;color:var(--text);outline:none}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(15,118,110,.12)}
+.field{margin-bottom:14px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:9px 16px;
+  border-radius:8px;border:1px solid #d5dbe3;background:#fff;color:#374151;font:inherit;
+  font-size:13.5px;cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:550}
+.tip{font-size:11.5px;color:var(--muted);margin-top:16px;line-height:1.5}
+.mono{font-family:var(--mono)}
+.toast{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px}
+.toast div{background:#1f2937;color:#fff;padding:9px 14px;border-radius:8px;font-size:13px}
+.toast div.err{background:#8c1d18}
+</style>
+</head>
+<body>
+<div class="auth-wrap">
+  <div class="auth-card">
+    <h1>TTCoin 设备管理</h1>
+    <p class="sub">输入自己的设备 ID 和管理员发的管理码</p>
+
+    <div class="field">
+      <label>设备 ID</label>
+      <input type="text" id="oid" class="mono" maxlength="32" placeholder="TC…" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>管理码</label>
+      <input type="text" id="ocode" class="mono" maxlength="32" placeholder="管理员发给你那个" autocomplete="off"
+        onkeydown="if(event.key==='Enter')doOwnerLogin()">
+    </div>
+    <button class="btn primary" style="width:100%" onclick="doOwnerLogin()">登录</button>
+
+    <p class="tip">
+      只能改自己设备的显示配置，看不到全局设置和日志。管理码找管理员要。
+    </p>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const CSRF = <?php echo json_encode($csrf); ?>;
+function toast(msg, kind){
+  const box = document.getElementById('toast');
+  const el = document.createElement('div');
+  el.className = kind || '';
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+async function post(action, payload){
+  const res = await fetch(location.pathname + '?action=' + action, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(Object.assign({_csrf: CSRF}, payload || {}))
+  });
+  return res.json();
+}
+async function doOwnerLogin(){
+  const id = document.getElementById('oid').value.trim().replace(/[^A-Za-z0-9]/g, '');
+  const code = document.getElementById('ocode').value.trim();
+  if(!id || !code){ toast('ID 和管理码都要填', 'err'); return; }
+  const r = await post('owner_login', {id:id, code:code});
+  if(r.ok){ location.reload(); } else { toast(r.message || '登录失败', 'err'); }
+}
+</script>
+</body>
+</html>
+<?php exit; endif; ?>
+
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1040,6 +1646,7 @@ td input,td select{padding:5px 8px;font-size:12.5px}
 .toast div.ok{background:#0b5f59}
 .panel{display:none}
 .panel.on{display:block}
+.scrollbox{overflow:auto;max-height:60vh}
 @media (max-width:860px){
   .shell{flex-direction:column;overflow-x:hidden;width:100%}
   .side{width:100%;max-width:100vw;flex:none;height:auto;position:static;border-right:0;
@@ -1049,6 +1656,33 @@ td input,td select{padding:5px 8px;font-size:12.5px}
   .side-foot{display:none}
   .main{padding:16px 14px 96px;overflow-x:hidden}
   .head{flex-direction:column;align-items:stretch}
+}
+#idsTable input[data-f=tz]{max-width:78px}
+
+/* —— 窄屏：输入全宽、两张表格转卡片（手机上一行一卡，不再横向溢出） —— */
+@media (max-width:700px){
+  .main{padding:14px 10px 96px}
+  .card{padding:14px 12px}
+  .savebar{padding:10px 12px}
+  .scrollbox{max-height:none;overflow:visible}
+  .grid{grid-template-columns:1fr}
+  #idsTable,#idsTable tbody,#logTable,#logTable tbody,#codesTable,#codesTable tbody{display:block}
+  #idsTable thead,#logTable thead,#codesTable thead{display:none}
+  #idsTable tr,#logTable tr,#codesTable tr{display:block;border:1px solid var(--line);border-radius:9px;
+    padding:8px 10px 4px;margin-bottom:10px;background:#fbfcfd}
+  /* 占位行（colspan 提示）退回普通块，不吃卡片栅格 */
+  #idsTable td[colspan],#logTable td[colspan],#codesTable td[colspan]{display:block;padding:6px 0}
+  #idsTable td,#codesTable td{display:grid;grid-template-columns:64px 1fr;gap:8px;align-items:center;
+    border:0;padding:5px 0;font-size:13px;white-space:normal;min-width:0}
+  #idsTable td::before,#codesTable td::before{content:attr(data-label);font-size:12px;color:var(--muted)}
+  #idsTable td:last-child,#codesTable td:last-child{display:flex;justify-content:flex-end;gap:8px;padding:8px 0 4px;
+    border-top:1px dashed var(--line);margin-top:4px}
+  #idsTable td:last-child::before,#codesTable td:last-child::before{content:''}
+  #idsTable td input,#idsTable td select{width:100%;max-width:none;font-size:13px;padding:7px 9px}
+  #logTable tr{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
+  #logTable td{display:inline-flex;gap:4px;border:0;padding:0;font-size:12px;
+    white-space:normal;word-break:break-all;min-width:0}
+  #logTable td::before{content:attr(data-label);font-size:11px;color:var(--muted);flex:none}
 }
 </style>
 </head>
@@ -1080,6 +1714,7 @@ td input,td select{padding:5px 8px;font-size:12.5px}
 
     <p class="tip" style="font-size:11.5px;color:var(--muted);margin-top:16px;line-height:1.5">
       密码以 hash 形式存在 <code>admin_pass.php</code>，忘记就删掉该文件重新设置。
+      设备用户不走这里，入口是 <code>owner.php</code>（用设备 ID + 管理码登录）。
     </p>
   </div>
 </div>
@@ -1241,6 +1876,8 @@ async function doSetPass(){
           客户端（表盘 / APP / Widget）在手机设置里填了「行情配置 ID」就会带 <code>?id=</code> 上来。
           这里登记的 ID 按行覆盖默认配置，没填的项继承上面的默认值。
           留空的项 = 不覆盖；整行都空 = 只做登记（日志里不再带 <code>!</code>）。
+          「涨幅口径 / 时区」两列：时区只在自然日口径下生效（<code>8</code> / <code>-5</code> / <code>5:30</code>），
+          留空 = 跟随上面的全局时区，所以每台设备可以各算各的当地零点。
         </p>
         <div class="note info" style="margin-bottom:14px">
           注意：<b>主币种（coin）的优先级高于固定币（fixed）</b>。如果全局配了主币种，
@@ -1252,12 +1889,14 @@ async function doSetPass(){
         <table id="idsTable">
           <thead>
             <tr>
-              <th style="width:24%">ID（32 位内）</th>
-              <th style="width:12%">模式</th>
-              <th style="width:11%">固定币</th>
-              <th style="width:15%">主币种</th>
-              <th style="width:8%">条数</th>
-              <th style="width:16%">顺序（可选）</th>
+              <th style="width:18%">ID（32 位内）</th>
+              <th style="width:9%">模式</th>
+              <th style="width:8%">固定币</th>
+              <th style="width:13%">主币种</th>
+              <th style="width:6%">条数</th>
+              <th style="width:13%">顺序（可选）</th>
+              <th style="width:9%">涨幅口径</th>
+              <th style="width:8%">时区</th>
               <th style="width:114px"></th>
             </tr>
           </thead>
@@ -1268,6 +1907,36 @@ async function doSetPass(){
         <div class="row" style="margin-top:12px">
           <button class="btn" onclick="addIdRow()">+ 添加 ID</button>
           <button class="btn" onclick="openPreview('')">预览默认一套</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>设备管理码</h2>
+        <p class="hint">
+          给每台设备发一个管理码：设备用户打开 <code>owner.php</code>（设备用户入口，与管理员后台分开），
+          输入自己的 ID + 管理码，就只能改自己这一行的独立配置
+          （模式 / 固定币 / 主币种 / 条数 / 顺序 / 涨幅口径 / 时区），看不到全局配置、日志和其它设备。
+          生成后把 ID 和码发给对方即可。
+        </p>
+        <div class="scrollbox">
+          <table id="codesTable">
+            <thead>
+              <tr>
+                <th style="width:38%">ID</th>
+                <th style="width:24%">管理码</th>
+                <th style="width:20%">生成时间</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <select id="codesPickId" style="max-width:340px"></select>
+          <button class="btn" onclick="genCode()">为选中 ID 生成管理码</button>
+        </div>
+        <div class="tip" style="font-size:11.5px;color:var(--muted);margin-top:6px">
+          下拉列表来自上面「按 ID 配置」里已登记保存的 ID（改完记得先保存）。重新生成会立刻作废旧码。
         </div>
       </div>
 
@@ -1406,7 +2075,7 @@ async function doSetPass(){
           </select>
           <span id="logStats" class="mono" style="font-size:12px;color:var(--muted)"></span>
         </div>
-        <div style="overflow:auto;max-height:60vh">
+        <div class="scrollbox">
           <table id="logTable">
             <thead>
               <tr><th>时间</th><th>类型</th><th>ID</th><th>事件</th><th>详情</th></tr>
@@ -1447,6 +2116,7 @@ const INIT   = <?php echo json_encode([
     'order' => $orderList,
     'coin'  => $coinList,
     'ids'   => (object) $idsMap,
+    'codes' => (object) admin_load_keys(),
 ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP); ?>;
 
 /* ------------------------------------------------------------------ 工具 */
@@ -1567,20 +2237,26 @@ function coinOptions(selected){
 }
 
 function addIdRow(row){
-  row = row || {id:'', mode:'', fixed:'', coin:'', topN:'', order:''};
+  row = row || {id:'', mode:'', fixed:'', coin:'', topN:'', order:'', change:'', tz:''};
   const tr = document.createElement('tr');
   tr.innerHTML =
-    '<td><input type="text" data-f="id" class="mono" maxlength="32" placeholder="TC…" value="' + (row.id || '') + '"></td>' +
-    '<td><select data-f="mode">' +
+    '<td data-label="ID"><input type="text" data-f="id" class="mono" maxlength="32" placeholder="TC…" value="' + (row.id || '') + '"></td>' +
+    '<td data-label="模式"><select data-f="mode">' +
       '<option value=""' + (!row.mode ? ' selected' : '') + '>跟随默认</option>' +
       '<option value="scroll"' + (row.mode === 'scroll' ? ' selected' : '') + '>scroll</option>' +
       '<option value="fixed"' + (row.mode === 'fixed' ? ' selected' : '') + '>fixed</option>' +
     '</select></td>' +
-    '<td><select data-f="fixed">' + coinOptions(row.fixed || '') + '</select></td>' +
-    '<td><input type="text" data-f="coin" class="mono" placeholder="BTC,ETH" value="' + (row.coin || '') + '"></td>' +
-    '<td><input type="number" data-f="topN" min="0" max="50" placeholder="—" value="' + (row.topN === 0 || row.topN ? row.topN : '') + '"></td>' +
-    '<td><input type="text" data-f="order" class="mono" placeholder="默认顺序" value="' + (row.order || '') + '"></td>' +
-    '<td><div style="display:flex;gap:4px;flex-wrap:nowrap">' +
+    '<td data-label="固定币"><select data-f="fixed">' + coinOptions(row.fixed || '') + '</select></td>' +
+    '<td data-label="主币种"><input type="text" data-f="coin" class="mono" placeholder="BTC,ETH" value="' + (row.coin || '') + '"></td>' +
+    '<td data-label="条数"><input type="number" data-f="topN" min="0" max="50" placeholder="—" value="' + (row.topN === 0 || row.topN ? row.topN : '') + '"></td>' +
+    '<td data-label="顺序"><input type="text" data-f="order" class="mono" placeholder="默认顺序" value="' + (row.order || '') + '"></td>' +
+    '<td data-label="涨幅"><select data-f="change">' +
+      '<option value=""' + (!row.change ? ' selected' : '') + '>跟随默认</option>' +
+      '<option value="24h"' + (row.change === '24h' ? ' selected' : '') + '>24h</option>' +
+      '<option value="tz"' + (row.change === 'tz' ? ' selected' : '') + '>自然日</option>' +
+    '</select></td>' +
+    '<td data-label="时区"><input type="text" data-f="tz" class="mono" placeholder="继承" title="自然日时区偏移：8 / -5 / 5:30，留空 = 跟随全局" value="' + (row.tz || '') + '"></td>' +
+    '<td data-label="操作"><div style="display:flex;gap:4px;flex-wrap:nowrap">' +
       '<button type="button" class="btn tiny" data-act="preview" title="预览这套配置">预览</button>' +
       '<button type="button" class="btn tiny" data-act="del" title="删除">×</button>' +
     '</div></td>';
@@ -1607,15 +2283,19 @@ Object.keys(INIT.ids || {}).forEach(function(id){
     fixed: o.fixed || '',
     coin: o.coin || '',
     topN: (o.topN === 0 || o.topN) ? o.topN : '',
-    order: o.order || ''
+    order: o.order || '',
+    change: o.change || '',
+    tz: o.tz || ''
   });
 });
 
 if(!tbody.children.length){
   const tr = document.createElement('tr');
-  tr.innerHTML = '<td colspan="7" style="color:var(--muted);font-size:12.5px">还没有按 ID 的配置。不登记也能用，全部走上面的默认一套。</td>';
+  tr.innerHTML = '<td colspan="9" style="color:var(--muted);font-size:12.5px">还没有按 ID 的配置。不登记也能用，全部走上面的默认一套。</td>';
   tbody.appendChild(tr);
 }
+
+renderCodes();
 
 /* ------------------------------------------------------------------ 收集 */
 function collectIds(){
@@ -1636,6 +2316,11 @@ function collectIds(){
     if(coin) o.coin = coin;
     if(topN !== '') o.topN = parseInt(topN, 10);
     if(order) o.order = order;
+    const chg = $('[data-f=change]', tr) ? $('[data-f=change]', tr).value : '';
+    if(chg) o.change = chg;
+    const tzEl = $('[data-f=tz]', tr);
+    const tz = tzEl ? tzEl.value.trim() : '';
+    if(tz) o.tz = tz;
     out[id] = o;
   });
   return out;
@@ -1792,14 +2477,108 @@ function renderLog(){
       : '<span class="mono" style="color:' + (known ? '#b3261e' : '#0b5f59') + '">' + r.id + '</span>';
     const evClass = r.event === 'error' ? 'bad' : (r.event === 'stale' ? '' : 'ok');
     html += '<tr>' +
-      '<td class="mono" style="font-size:11.5px;white-space:nowrap">' + r.time + '</td>' +
-      '<td><span class="badge">' + (r.type || '-') + '</span></td>' +
-      '<td>' + idHtml + '</td>' +
-      '<td><span class="badge ' + evClass + '">' + r.event + '</span></td>' +
-      '<td class="mono" style="font-size:11.5px;color:#6b7280;word-break:break-all">' + (r.detail || '') + '</td>' +
+      '<td data-label="时间" class="mono" style="font-size:11.5px;white-space:nowrap">' + r.time + '</td>' +
+      '<td data-label="类型"><span class="badge">' + (r.type || '-') + '</span></td>' +
+      '<td data-label="ID">' + idHtml + '</td>' +
+      '<td data-label="事件"><span class="badge ' + evClass + '">' + r.event + '</span></td>' +
+      '<td data-label="详情" class="mono" style="font-size:11.5px;color:#6b7280;word-break:break-all">' + (r.detail || '') + '</td>' +
       '</tr>';
   });
   tb.innerHTML = html;
+}
+
+/* ------------------------------------------------------------------ 设备管理码 */
+function renderCodes(){
+  const tb = $('#codesTable tbody');
+  const codes = INIT.codes || {};
+  const keys = Object.keys(codes).sort();
+
+  if(!keys.length){
+    tb.innerHTML = '<tr><td colspan="4" style="color:var(--muted);font-size:12.5px">还没有生成过管理码。从下拉里选一个已登记的 ID，点「生成管理码」。</td></tr>';
+    fillCodesPick();
+    return;
+  }
+
+  let html = '';
+  keys.forEach(function(id){
+    const c = codes[id] || {};
+    html += '<tr>' +
+      '<td data-label="ID" class="mono" style="word-break:break-all">' + id + '</td>' +
+      '<td data-label="管理码" class="mono"><b>' + (c.code || '') + '</b></td>' +
+      '<td data-label="生成时间" class="mono" style="font-size:11.5px;color:#6b7280">' + (c.time ? new Date(c.time * 1000).toLocaleString('zh-CN', {hour12:false}) : '—') + '</td>' +
+      '<td data-label="操作"><div style="display:flex;gap:4px;flex-wrap:nowrap">' +
+        '<button type="button" class="btn tiny" data-act="copy">复制</button>' +
+        '<button type="button" class="btn tiny" data-act="regen">重新生成</button>' +
+        '<button type="button" class="btn tiny" data-act="del">×</button>' +
+      '</div></td>' +
+      '</tr>';
+  });
+  tb.innerHTML = html;
+
+  $$('button[data-act]', tb).forEach(function(btn){
+    const id = btn.closest('tr').querySelector('td').textContent.trim();
+    btn.onclick = function(){
+      if(btn.dataset.act === 'copy'){ copyText((INIT.codes[id] || {}).code || ''); }
+      else if(btn.dataset.act === 'regen'){ codeSet(id, 'auto'); }
+      else if(btn.dataset.act === 'del'){ codeDel(id); }
+    };
+  });
+
+  fillCodesPick();
+}
+
+function fillCodesPick(){
+  const sel = document.getElementById('codesPickId');
+  if(!sel){ return; }
+  const cur = sel.value;
+  // 已登记的 ID（INIT.ids）∪ 已有码的 ID
+  const names = {};
+  Object.keys(INIT.ids || {}).forEach(function(id){ names[id] = 1; });
+  Object.keys(INIT.codes || {}).forEach(function(id){ names[id] = 1; });
+  let html = '<option value="">— 选一个设备 ID —</option>';
+  Object.keys(names).sort().forEach(function(id){
+    html += '<option value="' + id + '">' + id + ((INIT.codes || {})[id] ? '（已有码）' : '') + '</option>';
+  });
+  sel.innerHTML = html;
+  if(cur && names[cur]){ sel.value = cur; }
+}
+
+function copyText(text){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){ toast('已复制'); }, function(){ toast('复制失败，请手动选择'); });
+  }else{
+    toast('浏览器不支持一键复制，请手动选择复制');
+  }
+}
+
+async function codeSet(id, code){
+  const r = await post('code_set', {id:id, code:code});
+  if(r.ok){
+    INIT.codes[id] = {code: r.code, time: Math.floor(Date.now() / 1000)};
+    toast('管理码已生成：' + r.code + '（发给对方时连同 ID 一起发）', 'ok');
+    renderCodes();
+  }else{
+    toast(r.message || '生成失败', 'err');
+  }
+}
+
+async function codeDel(id){
+  if(!confirm('删除 ' + id + ' 的管理码？对方将无法再登录。')){ return; }
+  const r = await post('code_set', {id:id, code:''});
+  if(r.ok){
+    delete INIT.codes[id];
+    toast('已删除', 'ok');
+    renderCodes();
+  }else{
+    toast(r.message || '删除失败', 'err');
+  }
+}
+
+async function genCode(){
+  const sel = document.getElementById('codesPickId');
+  const id = (sel.value || '').replace(/[^A-Za-z0-9]/g, '');
+  if(!id){ toast('先从下拉里选一个设备 ID（来自「按 ID 配置」里登记保存的 ID）'); return; }
+  codeSet(id, 'auto');
 }
 
 /* ------------------------------------------------------------------ 杂项 */

@@ -7,13 +7,13 @@
 # "带密钥的网页诊断"一起挡死。
 
 <IfModule mod_authz_core.c>
-    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|admin_settings\.json(\.tmp)?|admin_pass\.php)$">
+    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|admin_settings\.json(\.tmp)?|admin_keys\.json(\.tmp)?|admin_pass\.php)$">
         Require all denied
     </FilesMatch>
 </IfModule>
 
 <IfModule !mod_authz_core.c>
-    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|admin_settings\.json(\.tmp)?|admin_pass\.php)$">
+    <FilesMatch "^(coin_cache\.json(\.(lock|tmp))?|coin\.log(\.old)?|lib\.php|admin_settings\.json(\.tmp)?|admin_keys\.json(\.tmp)?|admin_pass\.php)$">
         Order allow,deny
         Deny from all
     </FilesMatch>

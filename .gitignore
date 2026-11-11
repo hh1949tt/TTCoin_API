@@ -5,9 +5,11 @@ config.php
 
 # ---- 后台（admin.php）运行时数据 ----
 # admin_settings.json 里是全部设置（含代理 / 诊断密钥），admin_pass.php 是密码 hash，
-# 都不能进仓库。备份文件同理。
+# admin_keys.json 是各设备的管理码，都不能进仓库。备份文件同理。
 admin_settings.json
 admin_settings.json.tmp
+admin_keys.json
+admin_keys.json.tmp
 admin_pass.php
 config.php.bak.*
 
