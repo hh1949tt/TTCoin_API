@@ -44,6 +44,11 @@ FACE_IDS = '{"11111111":{"mode":"fixed","fixed":"DOGE"},"22222222":{"mode":"scro
 CHANGE_MODE = "24h"
 CHANGE_TZ = "8"
 LOG_REQUESTS = "1"
+# KV 请求日志（后台「请求日志」页）：每 2 分钟或攒满 12 条写一次 KV，
+# 保留天数与条数上限也能在后台改。不绑 KV 时这些值无效，只留 console 日志。
+LOG_KV = "1"
+LOG_KV_KEEP = "7"
+LOG_KV_MAX = "200"
 
 # 正式接管：域名必须托管在同一个 Cloudflare 账号下。
 #
@@ -74,3 +79,12 @@ LOG_REQUESTS = "1"
 # [[kv_namespaces]]
 # binding = "SETTINGS"
 # id = "<npx wrangler kv namespace create SETTINGS 输出的 id>"
+
+# ---------------------------------------------------------------------------
+# 定时清理过期日志（可选但建议）。每天 03:23 UTC 触发一次 scheduled()，
+# 把 KV 里超过保留天数的记录裁掉。不配也不会无限增长——每次刷盘都会顺带
+# 按保留期/条数裁剪，Cron 只是「长时间没有请求」时的兜底。
+# 控制台部署的话：Worker → Settings → Triggers → Cron Triggers → 填 23 3 * * *
+# ---------------------------------------------------------------------------
+# [triggers]
+# crons = ["23 3 * * *"]

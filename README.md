@@ -155,8 +155,10 @@ curl -s https://your-domain.example/coin.php
 `admin_settings.json`、`admin_pass.php` 已在 `.gitignore` 和 `.htaccess` 里排除。
 
 > Cloudflare Worker 版也有同类后台：`worker.js` 内置 `/admin`，设置存 KV，
-> 保存后约 30 秒生效、不用重新 deploy。准备步骤见 `worker/README.md` 的
-> 「网页后台 `/admin`」一节（Worker 没有文件系统，所以没有请求日志页）。
+> 保存后约 30 秒生效、不用重新 deploy。它同样提供请求日志页——日志按「内存聚合 +
+> 定时刷盘」写进 KV（默认 7 天 / 200 条，超出自动清理，也可配 Cron 定时清），
+> 不占文件系统。准备步骤与代价见 `worker/README.md` 的「网页后台 `/admin`」与
+> 「请求日志存 KV」两节。
 
 ## 接口约定
 

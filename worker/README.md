@@ -104,6 +104,9 @@ npx wrangler tail                 # 实时流（本地 wrangler dev 直接打在
 - `id` / `uid` / `ip` 就是"哪块表在请求"；`idKnown:false` 表示这个 id **没在
   `FACE_IDS` 里登记**（实际走默认一套，与 PHP 日志里 id 末尾的 `!` 同义）；
 - `cache` = `HIT` / `MISS` / `STALE` / `EMPTY`（上游全挂且无冷备，503）；
+- **不想敲命令**：绑了 KV 之后，后台 `/admin` 的「请求日志」页直接看最近 N 条
+  （时间 / 类型 / id / uid / IP / 缓存 / 币种，未登记 id 标红），见下面
+  「请求日志存 KV」一节；
 - 不想留日志：`wrangler.toml` 里 `LOG_REQUESTS = "0"`（默认 `"1"`）；
 - 需要按 uid 做长期统计（而不是翻日志）时，再挂 Analytics Engine 数据集，在
   `logRequest()` 里加一行 `env.ANALYTICS.writeDataPoint({ indexes: [uid], ... })`；
@@ -251,10 +254,48 @@ HttpOnly + Secure + SameSite=Strict，7 天有效）；全部 POST 校验 Origin
 
 两个和 PHP 版 admin.php 的差异要提前知道：
 
-- **请求日志页没有**：Worker 没有文件系统，日志只能 `npx wrangler tail` /
-  Workers Logs 看（或接 Analytics Engine，计费项）。后台能做的是配置管理。
+- **日志页依赖 KV**：Worker 没有文件系统，后台的「请求日志」是把最近 N 条写进
+  同一个 KV namespace（键 `request_log`），见下一节。不绑 KV 时自动退回
+  `wrangler tail` / Workers Logs。
 - **KV 免费额度**：每天 10 万次读、1000 次写。读有 30 秒隔离缓存兜底，
-  写只在保存时发生，个人使用毫无压力。
+  配置写只在保存时发生；日志写按下面的聚合策略控制，个人使用都在额度内。
+
+### 请求日志存 KV：写入策略与清理
+
+后台「请求日志」页能直接看到 `?id=` / `?uid=` / IP / 缓存命中，不用再翻
+`wrangler tail`。实现上不是「每个请求写一次 KV」——那会瞬间打爆免费额度
+（三端 60 秒一次就是 4320 写/天），而是：
+
+| 项目 | 默认 | 说明 |
+|---|---|---|
+| 缓冲 | 隔离实例内存 | 每个请求只 push 进数组，不阻塞响应（`ctx.waitUntil`） |
+| 刷盘时机 | 攒满 12 条 或 间隔 120 秒 | 约 720 写/天，留在免费额度内 |
+| 保留天数 | 7 天（后台可改 1~90） | 每次刷盘按时间裁剪 |
+| 最多条数 | 200 条（后台可改 20~1000） | 超出丢最旧的 |
+| 定时清理 | `scheduled()` 每天 03:23 UTC | 见下方 Cron Trigger；不配也会在刷盘时裁剪 |
+
+代价（都可接受，但要知道）：
+
+1. **可能丢少量条目**：隔离实例被回收时，缓冲区里还没刷盘的记录会一起消失。
+2. **不是实时**：KV 最终一致，写入后最多约 60 秒才在其它节点读到，后台刚发的
+   请求可能要等 1 分钟才出现。
+3. **多实例并发刷盘会互相覆盖**：两个实例同时 read-modify-write 时后写的赢，
+   诊断用途足够，不适合当审计。
+
+想更实时就调小 `LOG_FLUSH_GAP`（`worker.js` 顶部常量）；付费套餐下写次数不是
+问题。彻底关掉写入：后台「KV 日志存储」选「关」，或 `LOG_KV = "0"`。
+
+Cron Trigger（可选，控制台也能加）：
+
+```toml
+[triggers]
+crons = ["23 3 * * *"]     # 每天 03:23 UTC 清一次过期日志
+```
+
+控制台路径：Worker → Settings → Triggers → Cron Triggers → 填 `23 3 * * *`。
+
+日志写入前会清洗：`?id=` 只留字母数字、限 32 位，`?uid=` 限 64 位，IP 取
+`CF-Connecting-IP`，所以 KV 里不会出现任意注入内容。
 
 ## 已知限制
 

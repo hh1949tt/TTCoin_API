@@ -834,9 +834,11 @@ function clientUid(url) {
  * 那属于额外计费项，默认不启用。想彻底关掉日志：wrangler.toml 里
  * LOG_REQUESTS = "0"。
  */
-function logRequest(request, info) {
+function logRequest(request, info, env, ctx) {
+  let record = null;
+
   try {
-    console.log(JSON.stringify({
+    record = {
       t: new Date().toISOString(),
       type: info.type || '',
       id: info.id || '',
@@ -850,10 +852,197 @@ function logRequest(request, info) {
       src: info.sources || '',
       coin: info.coin || '',
       age: info.age || 0,
-    }));
+    };
+
+    console.log(JSON.stringify(record));
   } catch (e) {
     // 日志失败绝不影响响应
   }
+
+  // 同时攒进 KV 队列（后台「请求日志」页用）。没有 KV 绑定 / LOG_KV=0 时静默跳过。
+  if (record && env && envPick(env, 'LOG_REQUESTS', '1') !== '0') {
+    try {
+      queueLog(env, ctx, {
+        t: Math.floor(Date.now() / 1000),
+        y: record.type,
+        i: record.id,
+        k: record.idKnown ? 1 : 0,
+        u: record.uid,
+        p: record.ip,
+        c: record.colo,
+        h: record.cache,
+        s: record.src,
+        n: record.coin,
+        a: record.age,
+      });
+    } catch (e) {
+      // 同上：日志链路任何异常都不影响行情响应
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// KV 请求日志：Worker 没有文件系统，`console.log` 只能 tail 实时看，
+// 这里把最近 N 条写进 KV（键 request_log），后台页面直接读出来。
+//
+// 为什么不是「每个请求写一次 KV」：KV 免费额度只有 1000 次写/天，手表三端
+// 60 秒一次就 4320 次/天，会直接打爆。所以按「隔离实例内存缓冲 + 定时/攒满刷盘」
+// 聚合写入：默认每 120 秒或攒满 12 条写一次（≈720 次/天，留在免费额度内）。
+// 代价有两点，都写进 README 了：
+//   1. 实例被回收时缓冲区里未刷的条目会丢（诊断用途足够）；
+//   2. KV 最终一致，写入后最多 ~60 秒才在其它节点读到。
+// 想更实时就把 LOG_KV_GAP 调小（付费套餐下写次数不是问题）。
+// ---------------------------------------------------------------------------
+const LOG_KV_KEY = 'request_log';
+const LOG_BUFFER_MAX = 12;          // 攒满这么多条立刻刷
+const LOG_FLUSH_GAP = 120000;       // 否则最多每 120 秒刷一次
+const LOG_BUFFER_CAP = 200;         // 缓冲上限，防止极端情况下内存膨胀
+const LOG_ENTRY_TTL = 90 * 86400;   // KV 键本身的过期时间（兜底，正常由清理任务裁剪）
+
+let logBuffer = [];
+let logLastFlush = 0;
+let logFlushing = false;
+
+/** 日志保留天数（1~90，默认 7）。 */
+function logKeepDays(env) {
+  const n = Number.parseInt(envPick(env, 'LOG_KV_KEEP', '7'), 10);
+
+  return Number.isInteger(n) && n >= 1 && n <= 90 ? n : 7;
+}
+
+/** 日志最多保留条数（20~1000，默认 200）。 */
+function logMaxRows(env) {
+  const n = Number.parseInt(envPick(env, 'LOG_KV_MAX', '200'), 10);
+
+  return Number.isInteger(n) && n >= 20 && n <= 1000 ? n : 200;
+}
+
+/** 把一条日志放进缓冲，并按阈值触发刷盘（不阻塞响应）。 */
+function queueLog(env, ctx, entry) {
+  const kv = env && env.SETTINGS;
+
+  if (!kv || typeof kv.put !== 'function') return;      // 没绑 KV：只留 console 日志
+  if (envPick(env, 'LOG_KV', '1') === '0') return;      // 后台里显式关掉
+
+  logBuffer.push(entry);
+
+  if (logBuffer.length > LOG_BUFFER_CAP) {
+    logBuffer = logBuffer.slice(-LOG_BUFFER_CAP);
+  }
+
+  const task = flushLogs(env, false);
+
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(task);
+  } else {
+    task.catch(() => {});
+  }
+}
+
+/**
+ * 把缓冲区合并进 KV 里的数组（新→旧），同时按保留期/条数裁剪。
+ * force=true 时忽略时间阈值（清空、后台刷新等场景）。
+ */
+async function flushLogs(env, force) {
+  const kv = env && env.SETTINGS;
+
+  if (!kv || typeof kv.put !== 'function') return;
+  if (!logBuffer.length) return;
+  if (logFlushing) return;
+
+  const now = Date.now();
+  const due = force || logBuffer.length >= LOG_BUFFER_MAX || now - logLastFlush >= LOG_FLUSH_GAP;
+
+  if (!due) return;
+
+  logFlushing = true;
+
+  const batch = logBuffer.splice(0, logBuffer.length);
+
+  try {
+    let list = [];
+
+    try {
+      const raw = await kv.get(LOG_KV_KEY);
+      list = raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      list = [];      // 脏数据：直接重建，不让一条坏 JSON 卡死日志
+    }
+
+    if (!Array.isArray(list)) list = [];
+
+    const cutoff = Math.floor(now / 1000) - logKeepDays(env) * 86400;
+    const max = logMaxRows(env);
+
+    list = list.concat(batch).filter(item => item && typeof item.t === 'number' && item.t >= cutoff);
+    list = list.slice(-max);
+
+    if (list.length) {
+      await kv.put(LOG_KV_KEY, JSON.stringify(list), { expirationTtl: LOG_ENTRY_TTL });
+    } else {
+      await kv.delete(LOG_KV_KEY);
+    }
+
+    logLastFlush = Date.now();
+  } catch (e) {
+    // 写失败不影响行情；把没写进去的条目放回缓冲，下次再试（最多保留 CAP 条）
+    logBuffer = batch.concat(logBuffer).slice(-LOG_BUFFER_CAP);
+  } finally {
+    logFlushing = false;
+  }
+}
+
+/** 读取并裁剪日志（只读，不改 KV）。 */
+async function readLogs(env, limit) {
+  const kv = env && env.SETTINGS;
+
+  if (!kv || typeof kv.get !== 'function') return { rows: [], total: 0 };
+
+  let list = [];
+
+  try {
+    const raw = await kv.get(LOG_KV_KEY);
+    list = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    list = [];
+  }
+
+  if (!Array.isArray(list)) list = [];
+
+  const cutoff = Math.floor(Date.now() / 1000) - logKeepDays(env) * 86400;
+  const alive = list.filter(item => item && typeof item.t === 'number' && item.t >= cutoff);
+  const cap = Math.min(Math.max(Number.parseInt(limit, 10) || 200, 1), 1000);
+
+  return { rows: alive.slice(-cap).reverse(), total: alive.length, dropped: list.length - alive.length };
+}
+
+/** 定期清理：Cron 触发或后台手动触发（KV 只能整体重写）。 */
+async function pruneLogs(env) {
+  const kv = env && env.SETTINGS;
+
+  if (!kv || typeof kv.get !== 'function') return { ok: false, message: '未绑定 KV' };
+
+  let list = [];
+
+  try {
+    const raw = await kv.get(LOG_KV_KEY);
+    list = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    list = [];
+  }
+
+  if (!Array.isArray(list)) list = [];
+
+  const cutoff = Math.floor(Date.now() / 1000) - logKeepDays(env) * 86400;
+  const alive = list.filter(item => item && typeof item.t === 'number' && item.t >= cutoff).slice(-logMaxRows(env));
+
+  if (!alive.length) {
+    await kv.delete(LOG_KV_KEY);
+  } else if (alive.length !== list.length) {
+    await kv.put(LOG_KV_KEY, JSON.stringify(alive), { expirationTtl: LOG_ENTRY_TTL });
+  }
+
+  return { ok: true, before: list.length, after: alive.length };
 }
 
 function respond(body, meta) {
@@ -922,7 +1111,7 @@ function respond(body, meta) {
       sources: meta.sources,
       coin: meta.coin,
       age: meta.age,
-    });
+    }, meta.env, meta.ctx);
   }
 
   return new Response(body, { headers });
@@ -1021,7 +1210,7 @@ async function runDiag(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // 网页后台（/admin）在最前面分发：后台流量不进行情缓存、不写请求日志。
@@ -1052,7 +1241,7 @@ export default {
     const cache = caches.default;
 
     // 每个出口都要带上的「谁在请求」信息：响应头回显 uid、日志记 id / uid / IP
-    const who = { req: request, env, type, id: cfg.id, idKnown: cfg.idKnown, uid };
+    const who = { req: request, env, ctx, type, id: cfg.id, idKnown: cfg.idKnown, uid };
 
     const freshKey = cacheKey('data', type, false);
     const staleKey = cacheKey('data', type, true);
@@ -1142,7 +1331,7 @@ export default {
         uid,
         cache: 'EMPTY',
         sources: 'none',
-      });
+      }, env, ctx);
     }
 
     return new Response(JSON.stringify({ error: fetched.error }), {
@@ -1154,6 +1343,17 @@ export default {
         ...(uid ? { 'X-TTCoin-Uid': uid } : {}),
       },
     });
+  },
+
+  /**
+   * Cron Trigger（wrangler.toml 的 [triggers] 或控制台 Settings → Triggers）：
+   * 每天清一次过期日志。没配 Cron 也不会无限增长——每次刷盘都会按保留期
+   * 和条数上限裁剪，Cron 只是「没有请求时也能清」的兜底。
+   */
+  async scheduled(event, env, ctx) {
+    // 注意要合并 KV 里的设置：保留天数 / 条数上限可能是在后台改过的，
+    // 直接用原始 env 会退回 wrangler.toml 默认（清理力度不对）。
+    ctx.waitUntil(effectiveEnv(env).then(merged => pruneLogs(merged)));
   },
 };
 
@@ -1387,6 +1587,34 @@ export function adminValidate(input) {
     clean.LOG_REQUESTS = logReq;
   }
 
+  // —— KV 请求日志：总开关 + 保留天数 + 最多条数 ——
+  const logKv = str('LOG_KV');
+  if (logKv && logKv !== '0' && logKv !== '1') {
+    errors.push('LOG_KV 只能是 0 或 1');
+  } else if (logKv) {
+    clean.LOG_KV = logKv;
+  }
+
+  const logKeep = str('LOG_KV_KEEP');
+  if (logKeep !== '') {
+    const n = Number.parseInt(logKeep, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 90) {
+      errors.push('日志保留天数必须是 1~90 的整数');
+    } else {
+      clean.LOG_KV_KEEP = String(n);
+    }
+  }
+
+  const logMax = str('LOG_KV_MAX');
+  if (logMax !== '') {
+    const n = Number.parseInt(logMax, 10);
+    if (!Number.isInteger(n) || n < 20 || n > 1000) {
+      errors.push('日志最多条数必须是 20~1000 的整数');
+    } else {
+      clean.LOG_KV_MAX = String(n);
+    }
+  }
+
   // —— FACE_IDS：键限 32 位字母数字，行内 mode/fixed/coin/topN/order 逐项校验 ——
   let idsIn = src.FACE_IDS;
 
@@ -1558,6 +1786,9 @@ async function handleAdmin(request, env, url) {
         CHANGE_MODE: String(envPick(merged, 'CHANGE_MODE', CHANGE_MODE)).trim().toLowerCase(),
         CHANGE_TZ: String(envPick(merged, 'CHANGE_TZ', CHANGE_TZ)),
         LOG_REQUESTS: String(envPick(merged, 'LOG_REQUESTS', '1')),
+        LOG_KV: String(envPick(merged, 'LOG_KV', '1')),
+        LOG_KV_KEEP: String(logKeepDays(merged)),
+        LOG_KV_MAX: String(logMaxRows(merged)),
       },
       ids: ids,
       savedKeys: saved && typeof saved === 'object' ? Object.keys(saved) : [],
@@ -1651,6 +1882,43 @@ async function handleAdmin(request, env, url) {
     });
   }
 
+  // —— 请求日志（KV 里最近 N 条）——
+  if (path === '/admin/api/logs' && method === 'GET') {
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV，日志不可用' }, 400);
+
+    const mergedLog = await effectiveEnv(env);
+    const limit = url.searchParams.get('limit') || '200';
+    const got = await readLogs(mergedLog, limit);
+
+    return adminJson({
+      ok: true,
+      rows: got.rows,
+      total: got.total,
+      dropped: got.dropped || 0,
+      enabled: String(envPick(mergedLog, 'LOG_KV', '1')) !== '0',
+      keepDays: logKeepDays(mergedLog),
+      maxRows: logMaxRows(mergedLog),
+    });
+  }
+
+  if (path === '/admin/api/logs/clear' && method === 'POST') {
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV' }, 400);
+
+    await env.SETTINGS.delete(LOG_KV_KEY);
+    logBuffer = [];
+
+    return adminJson({ ok: true, message: '日志已清空' });
+  }
+
+  if (path === '/admin/api/logs/prune' && method === 'POST') {
+    if (!hasKv) return adminJson({ ok: false, message: '未绑定 KV' }, 400);
+
+    const mergedLog = await effectiveEnv(env);
+    const result = await pruneLogs(mergedLog);
+
+    return adminJson({ ok: true, message: '已清理：' + result.before + ' → ' + result.after + ' 条' });
+  }
+
   return adminJson({ ok: false, message: 'not found' }, 404);
 }
 
@@ -1693,6 +1961,8 @@ table{border-collapse:collapse;width:100%}
 th,td{border-bottom:1px solid var(--line);padding:6px 6px;font-size:12.5px;text-align:left;vertical-align:middle}
 th{color:var(--muted);font-weight:600;white-space:nowrap}
 td input,td select{max-width:none;padding:5px 8px}
+#idsTable td input,#idsTable td select{width:100%}
+#idsTable td:last-child{white-space:nowrap;text-align:right}
 td .num{max-width:70px}
 .msg{padding:9px 12px;border-radius:8px;font-size:13px;margin:10px 0;display:none}
 .msg.ok{background:#e6f4f1;color:var(--ok);display:block}
@@ -1701,7 +1971,43 @@ td .num{max-width:70px}
 ul{margin:6px 0 0;padding-left:18px}
 .preview{background:#10222b;color:#d8e6ee;border-radius:8px;padding:10px 12px;font:12px/1.7 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;display:none}
 .saved{font-size:12px;color:var(--muted)}
-@media(max-width:640px){td,th{padding:5px 4px}.card{padding:12px}}
+.log-wrap{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:10px}
+.log-wrap table{margin:0}
+.log-wrap th{position:sticky;top:0;background:#f7f9fa;z-index:1}
+.log-wrap td{font:12px/1.5 ui-monospace,Consolas,monospace;white-space:nowrap}
+.badge{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;border:1px solid var(--line);width:max-content;max-width:100%}
+.badge.bad{color:var(--bad);border-color:#e8c3d1;background:#fbe9ef}
+.badge.ok{color:var(--ok);border-color:#bfe0da;background:#e6f4f1}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+
+/* —— 窄屏：输入全宽、表格转卡片（手机上一行一卡，不再横向溢出） —— */
+@media(max-width:700px){
+  body{padding:14px 10px 24px}
+  h1{font-size:17px}
+  .sub{margin-bottom:14px}
+  .card{padding:13px 12px;margin-bottom:12px}
+  input[type=text],input[type=password],input[type=number],select{max-width:none;width:100%}
+  .row>div{flex:1 1 100%;white-space:normal!important;min-width:0}
+  .actions{position:sticky;bottom:0;background:var(--bg);padding:8px 0 2px;display:grid;grid-template-columns:1fr 1fr;gap:8px;z-index:2}
+  .actions button{margin:0!important;width:100%;white-space:normal;line-height:1.35;padding:9px 6px}
+  .actions #saveBtn{grid-column:1/-1}
+  /* 按 ID 表格 → 一行一张卡，每个字段带小标签，输入框占满剩余宽度 */
+  #idsTable,#idsTable tbody{display:block}
+  #idsTable thead{display:none}
+  #idsTable tr{display:block;border:1px solid var(--line);border-radius:9px;padding:8px 10px 4px;margin-bottom:10px;background:#fbfcfd}
+  #idsTable td{display:grid;grid-template-columns:62px 1fr;gap:8px;align-items:center;border:0;padding:5px 0;font-size:13px;white-space:normal;min-width:0}
+  #idsTable td::before{content:attr(data-label);font-size:12px;color:var(--muted)}
+  #idsTable td:last-child{display:flex;justify-content:flex-end;gap:8px;padding:8px 0 4px;border-top:1px dashed var(--line);margin-top:4px}
+  #idsTable td:last-child::before{content:''}
+  #idsTable td input,#idsTable td select{width:100%;max-width:none;font-size:13px;padding:7px 9px}
+  /* 请求日志 → 紧凑的「字段:值」流式布局（一行一卡，但不逐个字段占一行） */
+  .log-wrap{max-height:none;border:0;overflow:visible}
+  #logTable,#logTable tbody{display:block}
+  #logTable thead{display:none}
+  #logTable tr{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;border:1px solid var(--line);border-radius:9px;padding:7px 10px;margin-bottom:8px;background:#fbfcfd}
+  #logTable td{display:inline-flex;gap:4px;border:0;padding:0;font-size:12px;white-space:normal;word-break:break-all;min-width:0}
+  #logTable td::before{content:attr(data-label);font-size:11px;color:var(--muted);flex:none}
+}
 </style>
 </head>
 <body>
@@ -1737,7 +2043,7 @@ ul{margin:6px 0 0;padding-left:18px}
       <div class="chips" id="orderChips"></div>
       <div class="hint">全不勾 = 不覆盖，走 wrangler.toml 的 FACE_ORDER</div>
       <div class="row" style="margin-top:8px">
-        <div style="white-space:nowrap"><label>条数上限（scroll）</label><input type="number" id="topn" min="0" max="11" placeholder="0" style="display:inline-block;vertical-align:middle"> <span class="hint" style="display:inline;margin:0">0 = 按 ORDER 全给</span></div>
+        <div><label>条数上限（scroll）</label><input type="number" id="topn" min="0" max="11" placeholder="0" style="max-width:110px"><span class="hint" style="display:block;margin-top:4px">0 = 按 ORDER 全给</span></div>
       </div>
       <label>主币种 coin（三端共用，逗号分隔多币优先级，如 BTC,ETH；留空 = 默认币种）</label>
       <input type="text" id="coin" placeholder="留空 = 不覆盖">
@@ -1752,13 +2058,21 @@ ul{margin:6px 0 0;padding-left:18px}
         <label style="display:inline-flex;align-items:center;gap:6px;margin:0"><input type="radio" name="chg" value="tz">tz（指定时区自然日）</label>
       </div>
       <div class="row"><div><label>时区偏移（tz 模式）</label><input type="text" id="tz" placeholder="8 / 0 / -5 / 5:30" style="max-width:140px"></div>
-      <div><label>请求日志</label><select id="logreq" style="max-width:120px"><option value="1">开（wrangler tail 可看）</option><option value="0">关</option></select></div></div>
+      <div><label>请求日志</label><select id="logreq" style="max-width:120px"><option value="1">开</option><option value="0">关</option></select></div></div>
+      <div class="hint">「开」= 写 <code>wrangler tail</code> 日志 + 写入下方 KV 日志页</div>
+
+      <div class="row" style="margin-top:12px">
+        <div><label>KV 日志存储</label><select id="logkv" style="max-width:120px"><option value="1">开</option><option value="0">关</option></select></div>
+        <div><label>保留天数</label><input type="number" id="logkeep" min="1" max="90" placeholder="7" style="max-width:110px"></div>
+        <div><label>最多条数</label><input type="number" id="logmax" min="20" max="1000" placeholder="200" style="max-width:110px"></div>
+      </div>
+      <div class="hint">关闭后只保留实时日志（wrangler tail），不占 KV 写入额度</div>
     </div>
 
     <div class="card">
       <h2>按 ID 配置（?id= 登记了才覆盖默认一套）</h2>
       <table id="idsTable"><thead><tr>
-        <th>ID（≤32 位）</th><th>模式</th><th>固定币</th><th>主币种</th><th>条数</th><th>顺序</th><th></th>
+        <th style="width:26%">ID（≤32 位）</th><th style="width:12%">模式</th><th style="width:11%">固定币</th><th style="width:18%">主币种</th><th style="width:9%">条数</th><th style="width:16%">顺序</th><th style="width:72px"></th>
       </tr></thead><tbody></tbody></table>
       <div class="row" style="margin-top:10px"><button id="addId">+ 添加 ID</button></div>
       <div class="hint">留空的项 = 不覆盖；整行都空 = 只做登记（日志里不再标 unknown）</div>
@@ -1774,10 +2088,26 @@ ul{margin:6px 0 0;padding-left:18px}
       <div class="preview" id="pvOut"></div>
     </div>
 
-    <div class="row" style="margin-top:4px">
+    <div class="card">
+      <h2>请求日志（KV 里最近 200 条）</h2>
+      <div class="row" style="margin-bottom:2px">
+        <button id="logRefresh">刷新</button>
+        <button id="logPrune">清理过期</button>
+        <button id="logClear">清空</button>
+      </div>
+      <div class="log-wrap">
+        <table id="logTable"><thead><tr>
+          <th>时间</th><th>类型</th><th>ID</th><th>UID</th><th>IP</th><th>缓存</th><th>币种</th>
+        </tr></thead><tbody></tbody></table>
+      </div>
+      <div class="hint" id="logMeta" style="margin-top:8px">正在读取…</div>
+      <div class="hint">每 2 分钟或攒满 12 条写一次 KV（免费额度 1000 写/天）；写入后约 1 分钟才在其它节点可见。ID 带红底感叹号 = 没在「按 ID 配置」里登记，走的是默认一套。</div>
+    </div>
+
+    <div class="actions">
       <button class="primary" id="saveBtn">保存</button>
       <button id="resetBtn">恢复 wrangler.toml 默认</button>
-      <button id="logoutBtn" style="margin-left:auto">退出登录</button>
+      <button id="logoutBtn">退出登录</button>
     </div>
   </div>
 </div>
@@ -1847,12 +2177,12 @@ function idRow(one){
   const sel = (cur) => '<option value=""></option><option value="scroll"' + (cur === 'scroll' ? ' selected' : '') + '>scroll</option><option value="fixed"' + (cur === 'fixed' ? ' selected' : '') + '>fixed</option>';
   const fx = one.fixed || '', cn = one.coin || '', od = one.order || '';
   tr.innerHTML =
-    '<td><input type="text" class="i-id" value="' + (one.__id || '') + '" maxlength="32" placeholder="TC…"></td>' +
-    '<td><select class="i-mode">' + sel(one.mode) + '</select></td>' +
-    '<td><select class="i-fixed"><option value=""></option>' + opt(CFG.bases, fx) + '</select></td>' +
-    '<td><input type="text" class="i-coin" value="' + cn + '" placeholder="BTC,ETH"></td>' +
-    '<td><input type="number" class="i-topn num" min="0" max="11" value="' + (one.topN === undefined || one.topN === null ? '' : one.topN) + '"></td>' +
-    '<td><input type="text" class="i-order" value="' + od + '" placeholder="留空=继承"></td>' +
+    '<td data-label="ID"><input type="text" class="i-id" value="' + (one.__id || '') + '" maxlength="32" placeholder="TC…"></td>' +
+    '<td data-label="模式"><select class="i-mode">' + sel(one.mode) + '</select></td>' +
+    '<td data-label="固定币"><select class="i-fixed"><option value=""></option>' + opt(CFG.bases, fx) + '</select></td>' +
+    '<td data-label="主币种"><input type="text" class="i-coin" value="' + cn + '" placeholder="BTC,ETH"></td>' +
+    '<td data-label="条数"><input type="number" class="i-topn num" min="0" max="11" value="' + (one.topN === undefined || one.topN === null ? '' : one.topN) + '"></td>' +
+    '<td data-label="顺序"><input type="text" class="i-order" value="' + od + '" placeholder="留空=继承"></td>' +
     '<td style="white-space:nowrap"><button type="button" class="tiny pv">预览</button> <button type="button" class="tiny del">×</button></td>';
   tr.querySelector('.del').onclick = () => tr.remove();
   tr.querySelector('.pv').onclick = () => preview({ settings: collect(), id: tr.querySelector('.i-id').value });
@@ -1892,6 +2222,9 @@ function collect(){
     CHANGE_MODE: document.querySelector('input[name=chg]:checked').value,
     CHANGE_TZ: $('tz').value.trim(),
     LOG_REQUESTS: $('logreq').value,
+    LOG_KV: $('logkv').value,
+    LOG_KV_KEEP: $('logkeep').value.trim(),
+    LOG_KV_MAX: $('logmax').value.trim(),
     FACE_IDS: collectIds(),
   };
 }
@@ -1905,6 +2238,9 @@ function fill(values, ids){
   document.querySelectorAll('input[name=chg]').forEach(r => r.checked = r.value === values.CHANGE_MODE);
   $('tz').value = values.CHANGE_TZ || '';
   $('logreq').value = values.LOG_REQUESTS === '0' ? '0' : '1';
+  $('logkv').value = values.LOG_KV === '0' ? '0' : '1';
+  $('logkeep').value = values.LOG_KV_KEEP || '';
+  $('logmax').value = values.LOG_KV_MAX || '';
   renderIds(ids || {});
 }
 
@@ -1929,6 +2265,48 @@ async function preview(body){
   }
 }
 
+// —— 请求日志（KV）——
+function esc(v){
+  return String(v === undefined || v === null ? '' : v).replace(/[&<>"']/g, function(c){
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+  });
+}
+function fmtTime(sec){
+  const d = new Date(sec * 1000), p = function(n){ return String(n).padStart(2, '0'); };
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function renderLogs(j){
+  const tb = $('logTable').querySelector('tbody');
+  tb.innerHTML = '';
+  if (!j.rows.length) {
+    const empty = document.createElement('tr');
+    empty.innerHTML = '<td colspan="7" style="color:var(--muted);text-align:center;padding:14px">暂无记录（有请求后最多 2 分钟出现）</td>';
+    tb.appendChild(empty);
+  }
+  j.rows.forEach(function(r){
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td data-label="时间">' + fmtTime(r.t) + '</td>' +
+      '<td data-label="类型">' + esc(r.y) + '</td>' +
+      '<td data-label="ID">' + (r.i ? '<span class="badge ' + (r.k ? 'ok' : 'bad') + '">' + esc(r.i) + (r.k ? '' : ' !') + '</span>' : '—') + '</td>' +
+      '<td data-label="UID">' + (r.u ? esc(String(r.u).slice(0, 10)) + '…' : '—') + '</td>' +
+      '<td data-label="IP">' + (esc(r.p) || '—') + (r.c ? ' <span class="hint">' + esc(r.c) + '</span>' : '') + '</td>' +
+      '<td data-label="缓存">' + (esc(r.h) || '—') + '</td>' +
+      '<td data-label="币种">' + (esc(r.n) || '—') + '</td>';
+    tb.appendChild(tr);
+  });
+  $('logMeta').textContent = '共 ' + j.total + ' 条 · 保留 ' + j.keepDays + ' 天 · 上限 ' + j.maxRows + ' 条' + (j.enabled ? '' : ' · KV 写入已关闭');
+}
+async function loadLogs(){
+  try {
+    const j = await post('logs?limit=200', null, 'GET');
+    if (!j.ok) { $('logMeta').textContent = j.message || '读取失败'; return; }
+    renderLogs(j);
+  } catch (e) {
+    $('logMeta').textContent = '读取失败：' + (e && e.message ? e.message : e);
+  }
+}
+
 async function boot(){
   const s = await post('state', null, 'GET');
   if (!s.ok) { msg('状态读取失败', 'bad'); return; }
@@ -1950,6 +2328,7 @@ async function boot(){
     $('savedInfo').textContent = cfg.savedKeys.length ? ' · 已覆盖 ' + cfg.savedKeys.length + ' 项' : ' · 当前全部走 wrangler.toml 默认';
   }
   baseOptions($('fixed'), '（留空 = ORDER 第一项）');
+  await loadLogs();
 }
 
 $('loginBtn').onclick = async () => {
@@ -1962,6 +2341,19 @@ $('addId').onclick = () => document.querySelector('#idsTable tbody').appendChild
 
 $('pvCur').onclick = () => preview({ id: $('pvId').value });
 $('pvDraft').onclick = () => preview({ settings: collect(), id: $('pvId').value });
+
+$('logRefresh').onclick = loadLogs;
+$('logPrune').onclick = async () => {
+  const j = await post('logs/prune');
+  msg(j.message || (j.ok ? '已清理' : '清理失败'), j.ok ? 'ok' : 'bad');
+  loadLogs();
+};
+$('logClear').onclick = async () => {
+  if (!confirm('清空 KV 里的全部请求日志？')) return;
+  const j = await post('logs/clear');
+  msg(j.message || (j.ok ? '已清空' : '清空失败'), j.ok ? 'ok' : 'bad');
+  loadLogs();
+};
 
 $('saveBtn').onclick = async () => {
   const btn = $('saveBtn');
