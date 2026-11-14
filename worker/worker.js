@@ -412,7 +412,14 @@ export function buildPayload(quotes, opensByTz = {}, tzList = []) {
       const days = {};
 
       for (const clock of tzList) {
-        const param = clock.tz.param;
+        // tzList 的元素是 normalizeTz() 的时区描述（{offsetSec,param,label}）；
+        // 这里同时容忍 tzClock() 的结果（{tz,day,startMs}）——曾经这里只认
+        // clock.tz.param，而调用方传的是时区描述本身，tz 模式直接 TypeError，
+        // Worker 返回 1101。缺 param 就跳过，绝不让整个响应挂掉。
+        const tz = clock && clock.tz ? clock.tz : clock;
+        const param = tz && tz.param;
+        if (!param) continue;
+
         const open = opensByTz[param] && opensByTz[param][base];
 
         if (!open) continue;
@@ -1411,148 +1418,172 @@ async function runDiag(request, env) {
   });
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+/**
+ * 行情请求主流程（原样搬出 fetch，只为给外层加 try/catch 兜底）。
+ * 分派顺序：/owner → /admin → ?diag=1 → 行情出口。
+ */
+async function handleFetch(request, env, ctx) {
+  const url = new URL(request.url);
 
-    // 网页后台（/admin）在最前面分发：后台流量不进行情缓存、不写请求日志。
-    // 设置存 KV（admin_settings 键），保存即生效，不用 wrangler deploy。
-    if (url.pathname === '/owner' || url.pathname.startsWith('/owner/')) {
-      return handleOwner(request, env, url);
-    }
+  // 网页后台（/admin）在最前面分发：后台流量不进行情缓存、不写请求日志。
+  // 设置存 KV（admin_settings 键），保存即生效，不用 wrangler deploy。
+  if (url.pathname === '/owner' || url.pathname.startsWith('/owner/')) {
+    return handleOwner(request, env, url);
+  }
 
-    if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
-      return handleAdmin(request, env, url);
-    }
+  if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+    return handleAdmin(request, env, url);
+  }
 
-    if (url.searchParams.get('diag') === '1') return runDiag(request, env);
+  if (url.searchParams.get('diag') === '1') return runDiag(request, env);
 
-    // 把 KV 里保存的后台设置合并进 env（隔离实例内存缓存 30 秒，改配置后
-    // 最迟 30 秒全局生效）。之后 faceConfig / changeConfig / LOG_REQUESTS
-    // 读到的都是「KV 覆盖 wrangler.toml [vars]」的结果，下游代码零改动。
-    env = await effectiveEnv(env);
+  // 把 KV 里保存的后台设置合并进 env（隔离实例内存缓存 30 秒，改配置后
+  // 最迟 30 秒全局生效）。之后 faceConfig / changeConfig / LOG_REQUESTS
+  // 读到的都是「KV 覆盖 wrangler.toml [vars]」的结果，下游代码零改动。
+  env = await effectiveEnv(env);
 
-    // 三态白名单：face 是表盘版，出口有自己的滚屏 / 固定 + 币种顺序配置。
-    // 请求可带 ?id=（手机端「行情配置 ID」）：FACE_IDS 登记了就按登记覆盖，
-    // 没登记 / 没带 id 走默认一套。缓存键按 type 分开、不按 id 分 —— 缓存里
-    // 存的是**完整列表**，重排 / 裁剪只在出口发生，跟 app / widget 同一套规矩。
-    const rawType = url.searchParams.get('type');
-    const type = rawType === 'widget' ? 'widget' : rawType === 'face' ? 'face' : 'app';
-    // 三种形态都解析 id：face 用整套配置，app / widget 至少要用 coin 把主币种排前
-    const cfg = faceConfig(env, url.searchParams.get('id'));
-    const face = type === 'face' ? cfg : null;
-    // 设备匿名标识（?uid=）：只进响应头 + 日志，不进缓存键（见 clientUid 注释）
-    const uid = clientUid(url);
-    const change = changeConfig(env);
-    // 涨幅口径 + 时区：face 按 id 独立设置优先，没设 / 其他形态跟随全局
-    const chg = faceChange(change, cfg, type);
-    const chgTz = chg.mode === 'tz' ? chg.tz.param : '';
-    const changeEcho = { mode: chg.mode, tz: chg.tz, day: chg.day, startMs: chg.startMs };
-    const cache = caches.default;
+  // 三态白名单：face 是表盘版，出口有自己的滚屏 / 固定 + 币种顺序配置。
+  // 请求可带 ?id=（手机端「行情配置 ID」）：FACE_IDS 登记了就按登记覆盖，
+  // 没登记 / 没带 id 走默认一套。缓存键按 type 分开、不按 id 分 —— 缓存里
+  // 存的是**完整列表**，重排 / 裁剪只在出口发生，跟 app / widget 同一套规矩。
+  const rawType = url.searchParams.get('type');
+  const type = rawType === 'widget' ? 'widget' : rawType === 'face' ? 'face' : 'app';
+  // 三种形态都解析 id：face 用整套配置，app / widget 至少要用 coin 把主币种排前
+  const cfg = faceConfig(env, url.searchParams.get('id'));
+  const face = type === 'face' ? cfg : null;
+  // 设备匿名标识（?uid=）：只进响应头 + 日志，不进缓存键（见 clientUid 注释）
+  const uid = clientUid(url);
+  const change = changeConfig(env);
+  // 涨幅口径 + 时区：face 按 id 独立设置优先，没设 / 其他形态跟随全局
+  const chg = faceChange(change, cfg, type);
+  const chgTz = chg.mode === 'tz' ? chg.tz.param : '';
+  const changeEcho = { mode: chg.mode, tz: chg.tz, day: chg.day, startMs: chg.startMs };
+  const cache = caches.default;
 
-    // 每个出口都要带上的「谁在请求」信息：响应头回显 uid、日志记 id / uid / IP
-    const who = { req: request, env, ctx, type, id: cfg.id, idKnown: cfg.idKnown, uid };
+  // 每个出口都要带上的「谁在请求」信息：响应头回显 uid、日志记 id / uid / IP
+  const who = { req: request, env, ctx, type, id: cfg.id, idKnown: cfg.idKnown, uid };
 
-    const freshKey = cacheKey('data', type, false);
-    const staleKey = cacheKey('data', type, true);
+  const freshKey = cacheKey('data', type, false);
+  const staleKey = cacheKey('data', type, true);
 
-    const hit = await cache.match(freshKey);
+  const hit = await cache.match(freshKey);
 
-    if (hit) {
-      const text = await hit.text();
-      const age = Number(hit.headers.get('X-TTCoin-Stored') || 0);
-      const seconds = age > 0 ? Math.max(0, Math.round(Date.now() / 1000 - age)) : 0;
-      return respond(trim(text, type, cfg, chg.mode, chgTz), {
-        ...who,
-        cache: 'HIT',
-        face,
-        coin: cfg.coin,
-        change: changeEcho,
-        age: seconds,
-        sources: hit.headers.get('X-TTCoin-Source') || 'cache',
-      });
-    }
+  if (hit) {
+    const text = await hit.text();
+    const age = Number(hit.headers.get('X-TTCoin-Stored') || 0);
+    const seconds = age > 0 ? Math.max(0, Math.round(Date.now() / 1000 - age)) : 0;
+    return respond(trim(text, type, cfg, chg.mode, chgTz), {
+      ...who,
+      cache: 'HIT',
+      face,
+      coin: cfg.coin,
+      change: changeEcho,
+      age: seconds,
+      sources: hit.headers.get('X-TTCoin-Source') || 'cache',
+    });
+  }
 
-    const fetched = await fetchAll(env);
+  const fetched = await fetchAll(env);
 
-    if (fetched.ok) {
-      const full = JSON.stringify(fetched.data);
-      const stored = String(Math.round(Date.now() / 1000));
+  if (fetched.ok) {
+    const full = JSON.stringify(fetched.data);
+    const stored = String(Math.round(Date.now() / 1000));
 
-      const fresh = new Response(full, {
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Cache-Control': 'public, max-age=' + FRESH_TTL,
-          'X-TTCoin-Stored': stored,
-          'X-TTCoin-Source': fetched.sources,
-        },
-      });
-
-      // 新鲜副本要等写完再返回：否则紧接着的请求会二次回源
-      await cache.put(freshKey, fresh);
-
-      const stale = new Response(full, {
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Cache-Control': 'public, max-age=' + STALE_TTL,
-          'X-TTCoin-Stored': stored,
-          'X-TTCoin-Source': fetched.sources,
-        },
-      });
-
-      await cache.put(staleKey, stale);
-
-      return respond(trim(full, type, cfg, chg.mode, chgTz), {
-        ...who,
-        cache: 'MISS',
-        face,
-        coin: cfg.coin,
-        change: changeEcho,
-        sources: fetched.sources,
-        degraded: fetched.error !== '',
-      });
-    }
-
-    // 上游全挂：拿 7 天内的冷备顶上，绝不返回 503
-    const staleHit = await cache.match(staleKey);
-
-    if (staleHit) {
-      const text = await staleHit.text();
-      const stored = Number(staleHit.headers.get('X-TTCoin-Stored') || 0);
-      const age = stored > 0 ? Math.round(Date.now() / 1000 - stored) : 0;
-      return respond(trim(text, type, cfg, chg.mode, chgTz), {
-        ...who,
-        cache: 'STALE',
-        face,
-        coin: cfg.coin,
-        change: changeEcho,
-        age,
-        sources: staleHit.headers.get('X-TTCoin-Source') || 'cache',
-        degraded: true,
-      });
-    }
-
-    // 上游全挂且没有冷备：503 也要留一条日志（否则「一起挂了」在日志里是空白）
-    if (envPick(env, 'LOG_REQUESTS', '1') !== '0') {
-      logRequest(request, {
-        type,
-        id: cfg.id,
-        idKnown: cfg.idKnown,
-        uid,
-        cache: 'EMPTY',
-        sources: 'none',
-      }, env, ctx);
-    }
-
-    return new Response(JSON.stringify({ error: fetched.error }), {
-      status: 503,
+    const fresh = new Response(full, {
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': 'no-store',
-        'X-TTCoin-Source': 'none',
-        ...(uid ? { 'X-TTCoin-Uid': uid } : {}),
+        'Cache-Control': 'public, max-age=' + FRESH_TTL,
+        'X-TTCoin-Stored': stored,
+        'X-TTCoin-Source': fetched.sources,
       },
     });
+
+    // 新鲜副本要等写完再返回：否则紧接着的请求会二次回源
+    await cache.put(freshKey, fresh);
+
+    const stale = new Response(full, {
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'public, max-age=' + STALE_TTL,
+        'X-TTCoin-Stored': stored,
+        'X-TTCoin-Source': fetched.sources,
+      },
+    });
+
+    await cache.put(staleKey, stale);
+
+    return respond(trim(full, type, cfg, chg.mode, chgTz), {
+      ...who,
+      cache: 'MISS',
+      face,
+      coin: cfg.coin,
+      change: changeEcho,
+      sources: fetched.sources,
+      degraded: fetched.error !== '',
+    });
+  }
+
+  // 上游全挂：拿 7 天内的冷备顶上，绝不返回 503
+  const staleHit = await cache.match(staleKey);
+
+  if (staleHit) {
+    const text = await staleHit.text();
+    const stored = Number(staleHit.headers.get('X-TTCoin-Stored') || 0);
+    const age = stored > 0 ? Math.round(Date.now() / 1000 - stored) : 0;
+    return respond(trim(text, type, cfg, chg.mode, chgTz), {
+      ...who,
+      cache: 'STALE',
+      face,
+      coin: cfg.coin,
+      change: changeEcho,
+      age,
+      sources: staleHit.headers.get('X-TTCoin-Source') || 'cache',
+      degraded: true,
+    });
+  }
+
+  // 上游全挂且没有冷备：503 也要留一条日志（否则「一起挂了」在日志里是空白）
+  if (envPick(env, 'LOG_REQUESTS', '1') !== '0') {
+    logRequest(request, {
+      type,
+      id: cfg.id,
+      idKnown: cfg.idKnown,
+      uid,
+      cache: 'EMPTY',
+      sources: 'none',
+    }, env, ctx);
+  }
+
+  return new Response(JSON.stringify({ error: fetched.error }), {
+    status: 503,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-TTCoin-Source': 'none',
+      ...(uid ? { 'X-TTCoin-Uid': uid } : {}),
+    },
+  });
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    // 最外层兜底：任何未预期异常都转成 JSON 500 + console.error，而不是
+    // Cloudflare 的 1101「Worker threw exception」白页——手表至少能拿到
+    // 结构化错误，日志里也有可搜的堆栈。真正的 bug 该修还得修，这里只兜底。
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (err) {
+      console.error('ttcoin unhandled: ' + ((err && err.stack) || err));
+
+      return new Response(JSON.stringify({ error: 'internal error' }), {
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-TTCoin-Source': 'none',
+        },
+      });
+    }
   },
 
   /**

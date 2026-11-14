@@ -326,7 +326,8 @@ function ttcoin_change_tz_clocks()
     $clocks = [];
 
     $add = function ($tz) use (&$clocks) {
-        if ($tz === null || isset($clocks[$tz['param']])) {
+        // 只认 ttcoin_tz_parse() 的结果：形状不对就跳过，别在热路径上 fatal
+        if (!is_array($tz) || !isset($tz['param']) || isset($clocks[$tz['param']])) {
             return;
         }
 
@@ -397,6 +398,14 @@ function ttcoin_face_ids_need_tz()
  */
 function ttcoin_change_apply(array $data, $mode, $tzParam = '')
 {
+    // tzParam 只能是时区参数（"8" / "-5" / "5:30"）。传成数组 / 对象时
+    // array_key_exists() 会抛 TypeError（Worker 版就栽在同类「形状搞混」上），
+    // 这里顺手收敛成字符串，脏输入最多退回 24h，不会把接口打成 500。
+    if (!is_scalar($tzParam)) {
+        $tzParam = '';
+    }
+
+    $tzParam = (string) $tzParam;
     $out = [];
 
     foreach ($data as $item) {
@@ -677,7 +686,9 @@ function ttcoin_face_config($id = null)
 function ttcoin_face_change(array $config)
 {
     $global = ttcoin_change_config();
-    $mode   = $config['chg'] !== '' ? $config['chg'] : $global['mode'];
+    // 用 ?? 兜底：早期调用方传进来的数组可能没有 chg / chgTz 键
+    // （漏了会先报 Undefined array key，再把 null 当口径用）。
+    $mode   = ($config['chg'] ?? '') !== '' ? $config['chg'] : $global['mode'];
     $param  = ($config['chgTz'] ?? '') !== '' ? $config['chgTz'] : $global['tz']['param'];
 
     return ['mode' => $mode, 'tz' => $mode === 'tz' ? $param : ''];
@@ -1713,18 +1724,19 @@ function ttcoin_day_opens($symbols, $cfg, $budget = 4)
 {
     // 每个时区一份：-5 和 8 的「当地 00:00」不是同一个时刻，不能共用一份缓存
     $param = isset($cfg['tz']['param']) ? (string) $cfg['tz']['param'] : '0';
+    $day   = isset($cfg['day']) ? (string) $cfg['day'] : gmdate('Y-m-d');
     $slug  = $param === '' ? '0' : (string) preg_replace('/[^0-9A-Za-z]/', '_', $param);
     $file  = ttcoin_storage_path('cache', 'dayopen-' . $slug . '.json', 'coin_dayopen_' . $slug . '.json');
 
-    $readState = function () use ($file, $cfg) {
+    $readState = function () use ($file, $param, $day) {
         $raw = @file_get_contents($file);
         $state = is_string($raw) ? json_decode($raw, true) : null;
 
-        if (!is_array($state) || ($state['day'] ?? '') !== $cfg['day']
-            || ($state['tz'] ?? '') !== $cfg['tz']['param']) {
+        if (!is_array($state) || ($state['day'] ?? '') !== $day
+            || ($state['tz'] ?? '') !== $param) {
             return [
-                'day'    => $cfg['day'],
-                'tz'     => $cfg['tz']['param'],
+                'day'    => $day,
+                'tz'     => $param,
                 'opens'  => [],
                 'missed' => [],
             ];
